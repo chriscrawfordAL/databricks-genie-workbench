@@ -520,7 +520,11 @@ fi
 # ── Set up Lakebase Autoscaling (if configured) ──────────────────────────
 if [ -n "$LAKEBASE_INSTANCE" ] && [ -n "$SP_CLIENT_ID" ]; then
     echo "  Setting up Lakebase Autoscaling..."
-    uv run python "$SCRIPT_DIR/setup_lakebase.py" \
+    # psycopg is only needed by this deploy-time GRANT step (not the app runtime),
+    # so provide it ephemerally rather than adding it to the app dependencies.
+    # Without it, setup_lakebase.py can't run the SP CONNECT/CREATE grants and the
+    # app silently falls back to in-memory storage.
+    uv run --with 'psycopg[binary]' python "$SCRIPT_DIR/setup_lakebase.py" \
         --profile "$PROFILE" \
         --project-name "$LAKEBASE_INSTANCE" \
         --sp-client-id "$SP_CLIENT_ID" 2>&1 || \

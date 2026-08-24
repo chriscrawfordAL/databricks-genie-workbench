@@ -137,6 +137,41 @@ export interface CurrentUser {
   auth_source: string
 }
 
+// ── Cross-workspace remote connections ──
+export interface WorkspaceConnection {
+  workspace_id: string
+  name: string
+  host: string
+  client_id: string
+  status: string // active | active_no_system_tables | error | unknown
+  status_detail?: string | null
+  created_by?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface WorkspaceConnectionCreate {
+  name: string
+  host: string
+  client_id: string
+  client_secret: string
+}
+
+export interface WorkspaceConnectionUpdate {
+  name?: string
+  host?: string
+  client_id?: string
+  client_secret?: string
+}
+
+export interface WorkspaceTestResult {
+  ok: boolean
+  status: string
+  detail: string
+  user?: string | null
+  system_tables: boolean
+}
+
 // Benchmark question from Genie Agent JSON
 export interface BenchmarkQuestion {
   id: string

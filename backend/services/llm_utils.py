@@ -7,7 +7,7 @@ import time
 
 import httpx
 
-from backend.services.auth import get_workspace_client
+from backend.services.auth import get_home_workspace_client
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,9 @@ def call_serving_endpoint(
     if model is None:
         model = get_llm_model()
 
-    client = get_workspace_client()
+    # LLM/serving inference always targets the home workspace's endpoints,
+    # never a selected remote target (which may not host the same model).
+    client = get_home_workspace_client()
     host = client.config.host.rstrip("/")
 
     # Use SDK auth machinery to get proper headers for any auth type

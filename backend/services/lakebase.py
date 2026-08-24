@@ -29,6 +29,8 @@ _memory_store: dict = {
     "watch_message_cache": {},      # (space_id, conversation_id, message_id) -> dict
     "watch_sync_watermark": {},     # resource -> dict
     "watch_daily_rollup": {},       # (space_id, day) -> dict
+    # ── Cross-workspace remote connections ──
+    "workspace_connections": {},    # workspace_id -> dict (no secret material)
 }
 
 _pool = None
@@ -51,8 +53,8 @@ def _generate_credential() -> tuple[str, str] | None:
     """
     global _current_token
     try:
-        from backend.services.auth import get_service_principal_client
-        client = get_service_principal_client()
+        from backend.services.auth import get_home_service_principal_client
+        client = get_home_service_principal_client()
 
         # Autoscaling Lakebase: use postgres API with endpoint path
         if _lakebase_autoscaling_endpoint:
@@ -281,8 +283,29 @@ async def _ensure_schema():
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_watch_rollup_day ON genie.watch_daily_usage_rollup(day DESC)"
             )
+
+            # ── Cross-workspace remote connections ──
+            # Holds the metadata + secret-scope *reference* for each remote
+            # workspace the app can target. The SP OAuth client secret itself
+            # never lives here — it is stored in a Databricks secret scope in
+            # the home workspace; only (secret_scope, secret_key) are persisted.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS genie.workspace_connections (
+                    workspace_id VARCHAR(64) PRIMARY KEY,
+                    name         TEXT NOT NULL,
+                    host         TEXT NOT NULL,
+                    client_id    TEXT NOT NULL,
+                    secret_scope TEXT NOT NULL,
+                    secret_key   TEXT NOT NULL,
+                    status       TEXT NOT NULL DEFAULT 'unknown',
+                    status_detail TEXT,
+                    created_by   TEXT,
+                    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
         _lakebase_available = True
-        logger.info("Lakebase schema ready (5 workbench tables + 5 watch tables)")
+        logger.info("Lakebase schema ready (5 workbench tables + 5 watch tables + 1 connections table)")
     except Exception as e:
         logger.warning(f"Failed to ensure Lakebase schema: {e}. Falling back to in-memory storage.")
         _lakebase_available = False
@@ -321,8 +344,8 @@ async def init_pool():
     #   - Autoscaling: "projects/<name>/branches/<branch>/endpoints/<endpoint>"
     #   - Provisioned: a resource reference that doesn't end in ".com"
     if host.startswith("projects/") or "." not in host:
-        from backend.services.auth import get_service_principal_client
-        client = get_service_principal_client()
+        from backend.services.auth import get_home_service_principal_client
+        client = get_home_service_principal_client()
 
         # Try Lakebase Autoscaling first (projects/... path format)
         if host.startswith("projects/"):
@@ -945,4 +968,127 @@ async def watch_upsert_daily_rollup(row: dict) -> None:
             row.get("approx_usd"),
             row.get("feedback_pos") or 0,
             row.get("feedback_neg") or 0,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Cross-workspace remote connections.
+# These rows never hold secret material — only the secret-scope reference.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _connection_public_dict(row) -> dict:
+    """Shape a connections row/dict for internal use (includes secret ref)."""
+    return {
+        "workspace_id": row["workspace_id"],
+        "name": row["name"],
+        "host": row["host"],
+        "client_id": row["client_id"],
+        "secret_scope": row["secret_scope"],
+        "secret_key": row["secret_key"],
+        "status": row["status"],
+        "status_detail": row["status_detail"],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else row["created_at"],
+        "updated_at": row["updated_at"].isoformat() if hasattr(row["updated_at"], "isoformat") else row["updated_at"],
+    }
+
+
+async def list_workspace_connections() -> list[dict]:
+    """List all remote workspace connections (includes secret-scope refs)."""
+    await _maybe_retry_schema()
+    if not is_available():
+        return list(_memory_store["workspace_connections"].values())
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT workspace_id, name, host, client_id, secret_scope, secret_key,
+                   status, status_detail, created_by, created_at, updated_at
+            FROM genie.workspace_connections
+            ORDER BY created_at ASC
+        """)
+        return [_connection_public_dict(r) for r in rows]
+
+
+async def get_workspace_connection(workspace_id: str) -> Optional[dict]:
+    """Fetch a single remote workspace connection by id."""
+    await _maybe_retry_schema()
+    if not is_available():
+        return _memory_store["workspace_connections"].get(workspace_id)
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT workspace_id, name, host, client_id, secret_scope, secret_key,
+                   status, status_detail, created_by, created_at, updated_at
+            FROM genie.workspace_connections
+            WHERE workspace_id = $1
+        """, workspace_id)
+        return _connection_public_dict(row) if row else None
+
+
+async def upsert_workspace_connection(conn_dict: dict) -> None:
+    """Insert or update a remote workspace connection (no secret material)."""
+    now = datetime.utcnow()
+    if not is_available():
+        existing = _memory_store["workspace_connections"].get(conn_dict["workspace_id"], {})
+        _memory_store["workspace_connections"][conn_dict["workspace_id"]] = {
+            "created_at": existing.get("created_at", now.isoformat()),
+            **conn_dict,
+            "updated_at": now.isoformat(),
+        }
+        return
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO genie.workspace_connections
+                (workspace_id, name, host, client_id, secret_scope, secret_key,
+                 status, status_detail, created_by, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            ON CONFLICT (workspace_id) DO UPDATE SET
+                name          = EXCLUDED.name,
+                host          = EXCLUDED.host,
+                client_id     = EXCLUDED.client_id,
+                secret_scope  = EXCLUDED.secret_scope,
+                secret_key    = EXCLUDED.secret_key,
+                status        = EXCLUDED.status,
+                status_detail = EXCLUDED.status_detail,
+                updated_at    = NOW()
+        """,
+            conn_dict["workspace_id"],
+            conn_dict["name"],
+            conn_dict["host"],
+            conn_dict["client_id"],
+            conn_dict["secret_scope"],
+            conn_dict["secret_key"],
+            conn_dict.get("status", "unknown"),
+            conn_dict.get("status_detail"),
+            conn_dict.get("created_by"),
+        )
+
+
+async def update_workspace_connection_status(
+    workspace_id: str, status: str, status_detail: str | None = None
+) -> None:
+    """Update just the status/status_detail of a connection."""
+    if not is_available():
+        row = _memory_store["workspace_connections"].get(workspace_id)
+        if row:
+            row["status"] = status
+            row["status_detail"] = status_detail
+            row["updated_at"] = datetime.utcnow().isoformat()
+        return
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE genie.workspace_connections
+            SET status = $2, status_detail = $3, updated_at = NOW()
+            WHERE workspace_id = $1
+        """, workspace_id, status, status_detail)
+
+
+async def delete_workspace_connection(workspace_id: str) -> None:
+    """Delete a remote workspace connection row (secret cleanup is caller's job)."""
+    if not is_available():
+        _memory_store["workspace_connections"].pop(workspace_id, None)
+        return
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM genie.workspace_connections WHERE workspace_id = $1",
+            workspace_id,
         )

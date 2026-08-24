@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState, Component } from "react"
 import type { ReactNode, ErrorInfo } from "react"
 import { LayoutGrid, BarChart2, BookOpen } from "lucide-react"
 import { ThemeToggle } from "@/components/ThemeToggle"
+import { WorkspaceSwitcher } from "@/components/WorkspaceSwitcher"
 import { useTheme } from "@/hooks/useTheme"
 import { SpaceList } from "@/pages/SpaceList"
 import { SpaceDetail } from "@/pages/SpaceDetail"
@@ -210,7 +211,10 @@ export default function App() {
             </button>
           </nav>
 
-          <ThemeToggle />
+          <div className="flex items-center gap-1">
+            <WorkspaceSwitcher />
+            <ThemeToggle />
+          </div>
         </div>
         <div className="header-accent-line" />
       </header>

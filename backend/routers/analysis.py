@@ -188,14 +188,14 @@ async def get_settings():
     Returns read-only configuration values.
     """
     import os
-    from backend.services.auth import get_databricks_host
+    from backend.services.auth import get_home_databricks_host
     from backend.sql_executor import get_sql_warehouse_id
 
     return SettingsResponse(
         genie_space_id=None,  # This is session-specific, passed from frontend
         llm_model=os.environ.get("LLM_MODEL", "databricks-claude-sonnet-4-6"),
         sql_warehouse_id=get_sql_warehouse_id(),
-        databricks_host=get_databricks_host(),
+        databricks_host=get_home_databricks_host(),
         workspace_directory=os.environ.get("GENIE_TARGET_DIRECTORY", "").strip() or None,
     )
 

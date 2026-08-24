@@ -27,6 +27,32 @@ _auth_logged = False
 # Per-request OBO client stored in a context variable
 _obo_client: ContextVar[WorkspaceClient | None] = ContextVar("_obo_client", default=None)
 
+# Per-request TARGET workspace, set from the X-Target-Workspace header when the
+# user selects a remote workspace. When set, workspace-scoped SDK calls (Genie,
+# Unity Catalog, system tables, space CRUD) run against the remote workspace's
+# service-principal client. Home-only concerns (LLM/serving inference, Lakebase,
+# secret scopes, the caller's identity) must use the get_home_* accessors so
+# they ignore the target.
+_target_client: ContextVar[WorkspaceClient | None] = ContextVar("_target_client", default=None)
+_target_workspace_id: ContextVar[str | None] = ContextVar("_target_workspace_id", default=None)
+
+
+def set_target_workspace(workspace_id: str, client: WorkspaceClient) -> None:
+    """Set the remote target workspace + its client for the current request."""
+    _target_workspace_id.set(workspace_id)
+    _target_client.set(client)
+
+
+def clear_target_workspace() -> None:
+    """Clear the target workspace for the current request."""
+    _target_workspace_id.set(None)
+    _target_client.set(None)
+
+
+def get_target_workspace_id() -> str | None:
+    """Return the selected remote workspace id for this request, or None (home)."""
+    return _target_workspace_id.get()
+
 
 def is_running_on_databricks_apps() -> bool:
     """Check if running on Databricks Apps (vs local development)."""
@@ -101,12 +127,11 @@ def _get_default_client() -> WorkspaceClient:
     return _client
 
 
-def get_workspace_client() -> WorkspaceClient:
-    """Get the WorkspaceClient for the current context.
+def _home_workspace_client() -> WorkspaceClient:
+    """The home-workspace client: OBO (per-user) if set, else the SP singleton.
 
-    Returns the OBO (per-user) client if set, otherwise the default
-    singleton. This ensures all SDK calls in the request path use the
-    user's credentials when running on Databricks Apps.
+    This is the pre-cross-workspace behaviour of :func:`get_workspace_client`
+    and never follows a selected remote target.
     """
     obo = _obo_client.get()
     if obo is not None:
@@ -114,13 +139,38 @@ def get_workspace_client() -> WorkspaceClient:
     return _get_default_client()
 
 
-def require_obo_workspace_client() -> WorkspaceClient:
-    """Return only the request's user-authorized client.
+def get_home_workspace_client() -> WorkspaceClient:
+    """Home-workspace client, ignoring any selected remote target.
 
-    Unlike :func:`get_workspace_client`, this function never falls back to the
-    app service principal. Use it for reads whose visibility is explicitly
-    scoped to the current user's permissions.
+    Use for operations that must run in the deploying workspace regardless of
+    the selected target: LLM/serving inference, the caller's own identity, and
+    home-host display.
     """
+    return _home_workspace_client()
+
+
+def get_workspace_client() -> WorkspaceClient:
+    """Get the WorkspaceClient for the current context.
+
+    If a remote target workspace is selected for this request, returns that
+    workspace's service-principal client. Otherwise returns the OBO (per-user)
+    client if set, else the home SP singleton.
+    """
+    target = _target_client.get()
+    if target is not None:
+        return target
+    return _home_workspace_client()
+
+
+def require_obo_workspace_client() -> WorkspaceClient:
+    """Return the request's authorized client, never the home SP fallback.
+
+    For a remote target there is no per-user identity, so the remote SP client
+    is returned. On home, returns the OBO client or raises if absent.
+    """
+    target = _target_client.get()
+    if target is not None:
+        return target
     obo = _obo_client.get()
     if obo is None:
         raise RuntimeError("This operation requires user authorization")
@@ -130,25 +180,52 @@ def require_obo_workspace_client() -> WorkspaceClient:
 def get_service_principal_client() -> WorkspaceClient:
     """Get the service principal client (bypasses OBO).
 
-    Used for:
-    - App-level operations (Lakebase persistence, background tasks)
-    - Fallback when OBO token lacks required scopes (e.g., Genie API
-      requires 'genie' scope which user authorization may not provide
-      until the consent flow is triggered)
+    If a remote target workspace is selected, returns the remote SP client so
+    workspace-scoped SP operations (system tables, permissions) run there.
+    Otherwise returns the home SP singleton. Home-only concerns (Lakebase,
+    secret scopes) must use :func:`get_home_service_principal_client`.
+    """
+    target = _target_client.get()
+    if target is not None:
+        return target
+    return _get_default_client()
+
+
+def get_home_service_principal_client() -> WorkspaceClient:
+    """Get the *home* (deploying) workspace's SP client, ignoring any target.
+
+    Unlike :func:`get_service_principal_client`, this always returns the app's
+    own service-principal client for the workspace the app is deployed in
+    (east1). Use it for operations that must run against home regardless of the
+    selected target workspace — e.g. Databricks secret-scope reads/writes for
+    remote-connection credentials, and Lakebase persistence.
     """
     return _get_default_client()
 
 
 def get_databricks_host() -> str:
-    """Get the Databricks workspace host URL (without trailing slash)."""
+    """Get the workspace host URL (without trailing slash) for the current context.
+
+    Returns the remote target's host when one is selected (so space URLs and
+    links point at the remote workspace), else the home host.
+    """
+    target = _target_client.get()
+    if target is not None:
+        host = target.config.host
+        return host.rstrip("/") if host else ""
+    return get_home_databricks_host()
+
+
+def get_home_databricks_host() -> str:
+    """Get the home workspace host URL (without trailing slash), ignoring target."""
     client = _get_default_client()
     host = client.config.host
     return host.rstrip("/") if host else ""
 
 
 def get_llm_api_key() -> str:
-    """Get the API key for LLM serving endpoints."""
-    client = get_workspace_client()
+    """Get the API key for LLM serving endpoints (always the home workspace)."""
+    client = get_home_workspace_client()
     return client.config.token or os.environ.get("DATABRICKS_TOKEN", "")
 
 

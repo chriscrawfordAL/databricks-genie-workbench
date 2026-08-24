@@ -19,6 +19,7 @@ import type {
   UsageRollup,
   WorkspaceOverview,
 } from '@/watch/types/api'
+import { getActiveWorkspaceId } from '@/lib/api'
 
 const API_BASE = '/api/watch'
 // Backend caps statement_execution polling at 180s plus 50s wait_timeout
@@ -45,12 +46,14 @@ async function fetchJson<T>(
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeout)
   try {
+    const targetWorkspace = getActiveWorkspaceId()
     const res = await fetch(`${API_BASE}${path}`, {
       ...init,
       signal: ctrl.signal,
       headers: {
         'Content-Type': 'application/json',
         ...(init.headers || {}),
+        ...(targetWorkspace ? { 'X-Target-Workspace': targetWorkspace } : {}),
       },
     })
     if (!res.ok) {

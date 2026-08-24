@@ -58,6 +58,46 @@ class StarToggleRequest(BaseModel):
     starred: bool
 
 
+# ===== Cross-workspace remote connections =====
+
+class WorkspaceConnection(BaseModel):
+    """A remote workspace the app can target (no secret material)."""
+    workspace_id: str
+    name: str
+    host: str
+    client_id: str
+    status: str = "unknown"  # active | active_no_system_tables | error | unknown
+    status_detail: str | None = None
+    created_by: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class WorkspaceConnectionCreate(BaseModel):
+    """Request to add a remote workspace connection."""
+    name: str = Field(..., min_length=1, max_length=128)
+    host: str = Field(..., min_length=1, max_length=512)
+    client_id: str = Field(..., min_length=1, max_length=256)
+    client_secret: str = Field(..., min_length=1, max_length=1024)
+
+
+class WorkspaceConnectionUpdate(BaseModel):
+    """Request to update a remote workspace connection. Omitted fields unchanged."""
+    name: str | None = Field(None, min_length=1, max_length=128)
+    host: str | None = Field(None, min_length=1, max_length=512)
+    client_id: str | None = Field(None, min_length=1, max_length=256)
+    client_secret: str | None = Field(None, min_length=1, max_length=1024)
+
+
+class WorkspaceTestResult(BaseModel):
+    """Result of probing a remote workspace connection."""
+    ok: bool
+    status: str
+    detail: str = ""
+    user: str | None = None
+    system_tables: bool = False
+
+
 class AdminDashboardStats(BaseModel):
     """Org-wide statistics for the admin dashboard."""
     total_spaces: int

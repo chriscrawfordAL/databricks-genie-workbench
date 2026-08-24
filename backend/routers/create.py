@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 async def create_preflight(request: Request):
     """Check warehouse availability and OBO auth status for the Create flow."""
     import os
-    from backend.services.auth import get_workspace_client
+    from backend.services.auth import get_home_workspace_client
 
     obo_enabled = bool(getattr(request.state, "user_token", ""))
     app_name = os.environ.get("DATABRICKS_APP_NAME", "this app")
@@ -41,8 +41,9 @@ async def create_preflight(request: Request):
             warehouses_available = True
         else:
             # No app resource assigned; fall back to checking OBO user's warehouses
+            # (home workspace — the create preflight reflects the app's own access).
             if obo_enabled:
-                client = get_workspace_client()
+                client = get_home_workspace_client()
                 for wh in client.warehouses.list():
                     is_serverless = getattr(wh, "enable_serverless_compute", False)
                     warehouse_type = getattr(wh, "warehouse_type", "")
@@ -198,7 +199,14 @@ async def agent_chat(body: AgentChatRequest, request: Request):
     from backend.services.create_agent_session import (
         create_session, get_session_async, persist_session,
     )
-    from backend.services.auth import get_workspace_client, set_obo_user_token, clear_obo_user_token
+    from backend.services.auth import (
+        get_workspace_client,
+        set_obo_user_token,
+        clear_obo_user_token,
+        set_target_workspace,
+        clear_target_workspace,
+    )
+    from backend.services import workspaces as ws_service
     from backend.services.model_catalog import ModelValidationError, validate_chat_model
 
     agent = get_create_agent()
@@ -255,12 +263,24 @@ async def agent_chat(body: AgentChatRequest, request: Request):
     # the OBO context (ContextVars don't propagate into async generators
     # that outlive the middleware's call_next).
     user_token = getattr(request.state, "user_token", "")
+    target_workspace_id = getattr(request.state, "target_workspace_id", "") or ""
 
     _KEEPALIVE_INTERVAL = 15  # seconds between SSE keepalive comments
 
     async def event_stream():
         if user_token:
             set_obo_user_token(user_token)
+        # Re-establish the remote target inside the generator — ContextVars set
+        # by the middleware don't propagate into async generators that outlive
+        # call_next. Genie/UC tools then run against the target workspace while
+        # the agent's LLM calls stay on home (get_home_* accessors).
+        if target_workspace_id:
+            try:
+                client = await ws_service.get_client_for_workspace(target_workspace_id)
+                if client is not None:
+                    set_target_workspace(target_workspace_id, client)
+            except Exception:
+                logger.warning("Could not set target workspace in stream", exc_info=True)
         try:
             yield _sse_event("session", {"session_id": session.session_id})
 
@@ -284,6 +304,7 @@ async def agent_chat(body: AgentChatRequest, request: Request):
             await persist_session(session)
         finally:
             clear_obo_user_token()
+            clear_target_workspace()
 
     return StreamingResponse(
         event_stream(),

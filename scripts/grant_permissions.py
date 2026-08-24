@@ -33,6 +33,10 @@ from deploy_lib.uc import WATCH_SYSTEM_GRANTS
 
 # SP privileges on the GSO optimization schema — the SP runs optimization jobs
 # and needs full write access to state tables, MLflow models, and prompts.
+# Secret scope (in the home workspace) that holds remote workspace SP secrets
+# for cross-workspace connections. Must match services/workspaces.py:SECRET_SCOPE.
+WORKSPACES_SECRET_SCOPE = "genie-workbench-workspaces"
+
 SP_CATALOG_PRIVILEGES = {"USE_CATALOG"}
 SP_SCHEMA_PRIVILEGES = {
     "USE_SCHEMA",
@@ -434,6 +438,9 @@ def main() -> int:
     # issue these, so failures are warnings, not hard errors.
     _grant_watch_system_tables(profile=args.profile, principal=principal)
 
+    # Cross-workspace connections secret scope — best-effort.
+    _ensure_workspaces_secret_scope(profile=args.profile, principal=principal)
+
     return 0
 
 
@@ -469,6 +476,45 @@ def _grant_watch_system_tables(*, profile: str, principal: str) -> None:
         )
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
+
+
+def _ensure_workspaces_secret_scope(*, profile: str, principal: str) -> None:
+    """Ensure the cross-workspace secret scope exists and the app SP can use it.
+
+    The app also creates this scope at runtime (the creator gets MANAGE), but
+    that only works where the SP is allowed to create secret scopes. Creating it
+    here as the deployer and granting the SP MANAGE is more robust. Best-effort:
+    failures are warnings (the runtime fallback may still succeed).
+    """
+    try:
+        existing = _run_json([
+            "databricks", "secrets", "list-scopes", "--profile", profile, "-o", "json",
+        ])
+        scopes = existing.get("scopes", []) if isinstance(existing, dict) else existing
+        names = {s.get("name") for s in (scopes or [])}
+        if WORKSPACES_SECRET_SCOPE not in names:
+            _run([
+                "databricks", "secrets", "create-scope",
+                WORKSPACES_SECRET_SCOPE, "--profile", profile,
+            ])
+            print(f"[grant-permissions] Created secret scope '{WORKSPACES_SECRET_SCOPE}'")
+        # Grant the app SP MANAGE so it can read/write remote-workspace secrets.
+        _run([
+            "databricks", "secrets", "put-acl",
+            WORKSPACES_SECRET_SCOPE, principal, "MANAGE", "--profile", profile,
+        ])
+        print(
+            f"[grant-permissions] Secret-scope grant: MANAGE on "
+            f"'{WORKSPACES_SECRET_SCOPE}' -> {principal}"
+        )
+    except Exception as err:
+        print(
+            "[grant-permissions] WARNING: could not ensure the cross-workspace "
+            f"secret scope '{WORKSPACES_SECRET_SCOPE}': {str(err).splitlines()[-1]}\n"
+            "  Cross-workspace connection secrets rely on the app SP creating the "
+            "scope at runtime instead.",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

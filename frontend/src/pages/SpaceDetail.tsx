@@ -12,6 +12,7 @@ import { HistoryTab } from "./HistoryTab"
 import { useAnalysis } from "@/hooks/useAnalysis"
 import { SpaceOverview } from "@/components/SpaceOverview"
 import { AutoOptimizeTab } from "@/components/auto-optimize/AutoOptimizeTab"
+import { useWorkspace } from "@/hooks/WorkspaceContext"
 import type { SpaceTab } from "@/lib/navigation"
 import { createScanCoordinator } from "@/lib/scan-coordinator"
 
@@ -27,6 +28,8 @@ interface SpaceDetailProps {
 }
 
 export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, autoScan, onBack, onNavigate }: SpaceDetailProps) {
+  // Auto-Optimize runs only in the home workspace; hide/guard it for remote targets.
+  const { isRemote } = useWorkspace()
   const [scanResult, setScanResult] = useState<ScanResult | null>(null)
   const [isStarred, setIsStarred] = useState(false)
   const [isScanning, setIsScanning] = useState(false)
@@ -152,7 +155,8 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, 
 
   const tabs: { id: SpaceTab; label: string; icon: React.ReactNode }[] = [
     { id: "score", label: "Score", icon: <BarChart2 className="w-4 h-4" /> },
-    { id: "optimize", label: "Optimize", icon: <Rocket className="w-4 h-4" /> },
+    // Optimize is home-only — omit it when targeting a remote workspace.
+    ...(isRemote ? [] : [{ id: "optimize" as SpaceTab, label: "Optimize", icon: <Rocket className="w-4 h-4" /> }]),
     { id: "history", label: "History", icon: <Clock className="w-4 h-4" /> },
   ]
 
@@ -322,14 +326,24 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, 
         )}
 
         {activeTab === "optimize" && (
-          <AutoOptimizeTab
-            key={runId ?? "configure"}
-            spaceId={spaceId}
-            requestedRunId={runId}
-            onRunChange={(nextRunId) => onNavigate("optimize", nextRunId)}
-            onRefreshIqScore={handlePostOptimizationScan}
-            onViewIqScore={() => onNavigate("score")}
-          />
+          isRemote ? (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-6 text-center">
+              <h3 className="text-sm font-semibold text-primary">Auto-Optimize is home-only</h3>
+              <p className="text-sm text-muted mt-1">
+                Optimization runs only in the current (home) workspace. Switch back to the current workspace
+                from the header to optimize this agent.
+              </p>
+            </div>
+          ) : (
+            <AutoOptimizeTab
+              key={runId ?? "configure"}
+              spaceId={spaceId}
+              requestedRunId={runId}
+              onRunChange={(nextRunId) => onNavigate("optimize", nextRunId)}
+              onRefreshIqScore={handlePostOptimizationScan}
+              onViewIqScore={() => onNavigate("score")}
+            />
+          )
         )}
 
         {activeTab === "history" && (

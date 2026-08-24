@@ -25,9 +25,13 @@ from typing import Any
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementParameterListItem, StatementState
 
-from backend.services.auth import get_service_principal_client
+from backend.services.auth import get_service_principal_client, get_target_workspace_id
 
 logger = logging.getLogger(__name__)
+
+# Cache of resolved warehouse ids for remote target workspaces (workspace_id -> id).
+_REMOTE_WAREHOUSE_CACHE: dict[str, str] = {}
+_REMOTE_WAREHOUSE_LOCK = threading.Lock()
 
 
 # ─── In-process TTL cache ─────────────────────────────────────────────────
@@ -68,7 +72,10 @@ def system_tables_status() -> bool | None:
 
 def _cache_key(sql: str, parameters: list[StatementParameterListItem]) -> str:
     bag = sorted([(p.name, p.value, getattr(p.type, "value", str(p.type))) for p in parameters])
-    return f"{hash(sql)}|{json.dumps(bag)}"
+    # Scope the cache by target workspace so a remote workspace's results never
+    # collide with home's (or another remote's) under the same SQL + params.
+    ws = get_target_workspace_id() or "home"
+    return f"{ws}|{hash(sql)}|{json.dumps(bag)}"
 
 
 def _cache_get(key: str, ttl_seconds: int = _CACHE_TTL_SECONDS) -> list[dict[str, Any]] | None:
@@ -106,10 +113,40 @@ def warm_cost_overview_cache(days: int = 7) -> None:
 
 
 def _warehouse_id() -> str:
+    # For a remote target workspace, the home SQL_WAREHOUSE_ID does not exist —
+    # resolve (and cache) a usable warehouse in the remote workspace instead.
+    target = get_target_workspace_id()
+    if target:
+        return _resolve_remote_warehouse(target)
     wh = os.environ.get("SQL_WAREHOUSE_ID", "").strip()
     if not wh:
         raise RuntimeError("SQL_WAREHOUSE_ID env var is empty — system table queries cannot run.")
     return wh
+
+
+def _resolve_remote_warehouse(workspace_id: str) -> str:
+    """Pick a warehouse in the remote workspace to run system-table queries.
+
+    Prefers a RUNNING warehouse, else the first available. Cached per workspace.
+    """
+    with _REMOTE_WAREHOUSE_LOCK:
+        cached = _REMOTE_WAREHOUSE_CACHE.get(workspace_id)
+    if cached:
+        return cached
+    client = get_service_principal_client()  # target-aware: the remote SP client
+    warehouses = list(client.warehouses.list())
+    if not warehouses:
+        raise RuntimeError(
+            f"No SQL warehouse available in remote workspace {workspace_id} for system-table queries."
+        )
+    chosen = next(
+        (w for w in warehouses if getattr(getattr(w, "state", None), "value", str(getattr(w, "state", ""))) == "RUNNING"),
+        warehouses[0],
+    )
+    wh_id = chosen.id
+    with _REMOTE_WAREHOUSE_LOCK:
+        _REMOTE_WAREHOUSE_CACHE[workspace_id] = wh_id
+    return wh_id
 
 
 def _client() -> WorkspaceClient:
@@ -202,25 +239,26 @@ def _p(name: str, value: Any, value_type: str = "STRING") -> StatementParameterL
 # remains the source for the *set* of spaces and their metadata (titles,
 # configured data sources); it has no cost/usage/lineage data of its own.
 
-_CURRENT_WS_ID: str | None = None
-_CURRENT_WS_ID_RESOLVED = False
+# Resolved numeric workspace ids, cached per target ("home" or a remote id).
+_WS_ID_CACHE: dict[str, str | None] = {}
 
 
 def _current_workspace_id() -> str | None:
-    """This app's own workspace id, resolved once via the SDK (cached).
+    """The numeric workspace id to scope system-table queries to.
 
-    Returns None if resolution fails; `_ws_clause` then fails *closed*
+    For a remote target this is the remote workspace's id (resolved via the
+    target-aware client); on home it is this app's own workspace id. Cached per
+    target. Returns None if resolution fails; `_ws_clause` then fails *closed*
     (scopes the query to no rows) rather than leaking other workspaces' data.
     """
-    global _CURRENT_WS_ID, _CURRENT_WS_ID_RESOLVED
-    if not _CURRENT_WS_ID_RESOLVED:
-        _CURRENT_WS_ID_RESOLVED = True
+    key = get_target_workspace_id() or "home"
+    if key not in _WS_ID_CACHE:
         try:
-            _CURRENT_WS_ID = str(_client().get_workspace_id())
+            _WS_ID_CACHE[key] = str(_client().get_workspace_id())
         except Exception as e:  # noqa: BLE001 - never break queries on this
-            logger.warning("could not resolve current workspace id: %s", e)
-            _CURRENT_WS_ID = None
-    return _CURRENT_WS_ID
+            logger.warning("could not resolve workspace id for %s: %s", key, e)
+            _WS_ID_CACHE[key] = None
+    return _WS_ID_CACHE[key]
 
 
 def _ws_clause(params: list[StatementParameterListItem], col: str = "workspace_id") -> str:

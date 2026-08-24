@@ -6,8 +6,10 @@ import { Suspense, lazy, useEffect, useState } from "react"
 import {
   TrendingUp, TrendingDown, AlertTriangle, Award, BarChart2, RefreshCw,
   LayoutGrid, DollarSign, Database, Settings as SettingsIcon, MessageSquare,
+  Building2,
 } from "lucide-react"
 import { getAdminDashboard, getLeaderboard, getAlerts } from "@/lib/api"
+import { WorkspacesManager } from "@/components/WorkspacesManager"
 import { getScoreColor, MATURITY_COLORS } from "@/lib/utils"
 import type { AdminDashboardStats, LeaderboardEntry, AlertItem } from "@/types"
 
@@ -26,7 +28,7 @@ const WatchSettings = lazy(() =>
 const WatchFeedback = lazy(() =>
   import("@/watch/pages/Feedback").then(m => ({ default: m.Feedback })))
 
-type AdminSubTab = "overview" | "spaces" | "cost" | "feedback" | "resources" | "settings"
+type AdminSubTab = "overview" | "spaces" | "cost" | "feedback" | "resources" | "workspaces" | "settings"
 
 interface AdminDashboardProps {
   onSelectSpace?: (spaceId: string, displayName: string) => void
@@ -63,6 +65,7 @@ const SUB_TABS: { id: AdminSubTab; label: string; icon: React.ReactNode }[] = [
   { id: "cost",      label: "Cost",      icon: <DollarSign className="w-4 h-4" /> },
   { id: "feedback",  label: "Feedback",  icon: <MessageSquare className="w-4 h-4" /> },
   { id: "resources", label: "Resources", icon: <Database className="w-4 h-4" /> },
+  { id: "workspaces", label: "Workspaces", icon: <Building2 className="w-4 h-4" /> },
   { id: "settings",  label: "Settings",  icon: <SettingsIcon className="w-4 h-4" /> },
 ]
 
@@ -329,6 +332,10 @@ export function AdminDashboard({ onSelectSpace, initialSubTab }: AdminDashboardP
         <Suspense fallback={<SubTabFallback />}>
           <WatchResourceRollup />
         </Suspense>
+      </KeepAliveTab>
+
+      <KeepAliveTab active={subTab === "workspaces"}>
+        <WorkspacesManager />
       </KeepAliveTab>
 
       <KeepAliveTab active={subTab === "settings"}>

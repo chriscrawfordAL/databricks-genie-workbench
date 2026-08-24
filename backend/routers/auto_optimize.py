@@ -11,7 +11,7 @@ import re
 import time
 from typing import Annotated, Any, Callable, Literal, TypeVar
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from backend.models import (
@@ -48,7 +48,25 @@ from genie_space_optimizer.integration import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/auto-optimize")
+
+def _forbid_remote_target() -> None:
+    """Auto-Optimize (GSO) runs only in the home workspace.
+
+    The GSO job, its Unity Catalog tables, and the SQL warehouse all live in the
+    deploying workspace, so reject any request made while a remote workspace is
+    selected as the target.
+    """
+    from backend.services.auth import get_target_workspace_id
+
+    if get_target_workspace_id():
+        raise HTTPException(
+            status_code=400,
+            detail="Auto-Optimize runs only in the current (home) workspace. "
+            "Switch back to the current workspace to use Auto-Optimize.",
+        )
+
+
+router = APIRouter(prefix="/api/auto-optimize", dependencies=[Depends(_forbid_remote_target)])
 
 
 def _genie_benchmark_url(

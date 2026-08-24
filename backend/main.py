@@ -64,13 +64,20 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from backend.services.auth import is_running_on_databricks_apps, set_obo_user_token, clear_obo_user_token
+from backend.services.auth import (
+    is_running_on_databricks_apps,
+    set_obo_user_token,
+    clear_obo_user_token,
+    set_target_workspace,
+    clear_target_workspace,
+)
 from backend.routers.analysis import router as analysis_router
 from backend.routers.spaces import router as spaces_router
 from backend.routers.admin import router as admin_router
 from backend.routers.auth import router as auth_router
 from backend.routers.create import router as create_router
 from backend.routers.auto_optimize import router as auto_optimize_router
+from backend.routers.workspaces import router as workspaces_router
 from backend.watch.routers import (
     watch_admin_router,
     watch_cost_router,
@@ -102,6 +109,7 @@ class OBOAuthMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:
+        request.state.target_workspace_id = ""
         if request.url.path.startswith("/api/"):
             token = request.headers.get("x-forwarded-access-token", "")
             if token:
@@ -110,6 +118,7 @@ class OBOAuthMiddleware(BaseHTTPMiddleware):
             else:
                 logger.info("OBO: no x-forwarded-access-token, using SP for %s", request.url.path)
             request.state.user_token = token
+            await self._maybe_set_target(request)
         else:
             request.state.user_token = ""
 
@@ -118,7 +127,30 @@ class OBOAuthMiddleware(BaseHTTPMiddleware):
         is_streaming = getattr(response, "media_type", "") == "text/event-stream"
         if not is_streaming:
             clear_obo_user_token()
+            clear_target_workspace()
         return response
+
+    async def _maybe_set_target(self, request: Request) -> None:
+        """Resolve the X-Target-Workspace header into a remote client, if present.
+
+        Connection-management endpoints (/api/workspaces/*) always run against
+        the home workspace (secrets + Lakebase), so we never apply a target
+        there. An unknown/stale workspace id falls back to home.
+        """
+        workspace_id = request.headers.get("x-target-workspace", "").strip()
+        if not workspace_id or request.url.path.startswith("/api/workspaces"):
+            return
+        try:
+            from backend.services import workspaces as ws_service
+            client = await ws_service.get_client_for_workspace(workspace_id)
+            if client is not None:
+                set_target_workspace(workspace_id, client)
+                request.state.target_workspace_id = workspace_id
+                logger.info("Targeting remote workspace %s for %s", workspace_id, request.url.path)
+            else:
+                logger.warning("Unknown target workspace '%s' — using home", workspace_id)
+        except Exception:
+            logger.warning("Failed to resolve target workspace '%s' — using home", workspace_id, exc_info=True)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -215,6 +247,7 @@ app.include_router(admin_router)
 app.include_router(auth_router)
 app.include_router(create_router)
 app.include_router(auto_optimize_router)
+app.include_router(workspaces_router)
 
 # GenieWatch (observability) — all routes under /api/watch/*
 app.include_router(watch_spaces_router)

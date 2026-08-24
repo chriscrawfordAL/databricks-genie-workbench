@@ -5,7 +5,7 @@ import os
 
 from fastapi import APIRouter, Request
 
-from backend.services.auth import get_workspace_client, is_running_on_databricks_apps
+from backend.services.auth import get_home_workspace_client, is_running_on_databricks_apps
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auth")
@@ -41,9 +41,9 @@ async def get_current_user(request: Request) -> dict:
             "auth_source": "dev_env",
         }
 
-    # Try SDK
+    # Try SDK — always the home identity, never a selected remote target.
     try:
-        client = get_workspace_client()
+        client = get_home_workspace_client()
         user = client.current_user.me()
         return {
             "email": user.user_name or "",
@@ -66,7 +66,7 @@ async def get_current_user(request: Request) -> dict:
 async def auth_status() -> dict:
     """Health check with auth state."""
     try:
-        client = get_workspace_client()
+        client = get_home_workspace_client()
         return {
             "ok": True,
             "host": client.config.host,

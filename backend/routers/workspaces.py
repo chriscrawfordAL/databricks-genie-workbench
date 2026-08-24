@@ -18,46 +18,22 @@ from backend.models import (
     WorkspaceTestResult,
 )
 from backend.services import workspaces as ws_service
-from backend.services.auth import get_workspace_client
+from backend.services.auth import is_workspace_admin
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/workspaces")
 
 
-def _is_admin_via_sdk() -> bool:
-    """Check workspace-admin membership via SCIM using the current user's client.
-
-    Databricks Apps does not reliably forward an ``X-Forwarded-Groups`` header,
-    so header-only detection rejects real admins. As a robust fallback we read
-    the caller's own SCIM record (via the OBO client) and look for membership in
-    the workspace ``admins`` group.
-    """
-    try:
-        me = get_workspace_client().current_user.me()
-        for g in (me.groups or []):
-            name = (getattr(g, "display", None) or getattr(g, "value", "") or "")
-            if name.lower() == "admins":
-                return True
-    except Exception:
-        logger.warning("SDK admin check failed", exc_info=True)
-    return False
+def _caller_is_admin(request: Request) -> bool:
+    return is_workspace_admin(
+        forwarded_groups=request.headers.get("X-Forwarded-Groups", ""),
+        forwarded_email=_caller_email(request) or "",
+    )
 
 
 def _require_admin(request: Request) -> None:
-    """Gate connection management to workspace admins.
-
-    Admin is established by any of: the forwarded groups header containing
-    ``admins`` (when present), SCIM group membership via the SDK, or the local
-    DEV_ADMIN / DEV_USER_EMAIL escape hatches.
-    """
-    groups = (request.headers.get("X-Forwarded-Groups", "") or "").lower()
-    is_admin = (
-        "admins" in groups
-        or os.environ.get("DEV_ADMIN", "").lower() == "true"
-        or bool(os.environ.get("DEV_USER_EMAIL"))
-        or _is_admin_via_sdk()
-    )
-    if not is_admin:
+    """Gate connection management to workspace admins."""
+    if not _caller_is_admin(request):
         raise HTTPException(status_code=403, detail="Admin access required to manage workspace connections")
 
 
@@ -70,8 +46,15 @@ def _caller_email(request: Request) -> str | None:
 
 
 @router.get("", response_model=list[WorkspaceConnection])
-async def list_workspaces() -> list[WorkspaceConnection]:
-    """List registered remote workspace connections (no secrets)."""
+async def list_workspaces(request: Request) -> list[WorkspaceConnection]:
+    """List registered remote workspace connections (no secrets).
+
+    Admin-only: cross-workspace targeting is an admin capability, so non-admins
+    get an empty list (which hides the header switcher) rather than a 403 — this
+    keeps the provider's boot-time fetch quiet for ordinary users.
+    """
+    if not _caller_is_admin(request):
+        return []
     conns = await ws_service.list_connections()
     return [WorkspaceConnection(**c) for c in conns]
 

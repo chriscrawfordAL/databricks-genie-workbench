@@ -21,6 +21,7 @@ target workspace.
 
 import base64
 import logging
+import time
 import uuid
 
 from databricks.sdk import WorkspaceClient
@@ -35,8 +36,24 @@ logger = logging.getLogger(__name__)
 # Databricks secret scope (in the home workspace) that holds remote SP secrets.
 SECRET_SCOPE = "genie-workbench-workspaces"
 
-# Cache of built remote clients, keyed by workspace_id.
-_remote_clients: dict[str, WorkspaceClient] = {}
+# Cache of built remote clients, keyed by workspace_id -> (built_at, client).
+# The TTL bounds credential staleness: a secret rotated on another replica is
+# picked up within _CLIENT_TTL_SECONDS when the cached client expires and is
+# rebuilt from the secret scope (per-request invalidation only reaches the
+# replica that performed the rotation).
+_remote_clients: dict[str, tuple[float, WorkspaceClient]] = {}
+_CLIENT_TTL_SECONDS = 600
+
+
+def _get_cached_client(workspace_id: str) -> WorkspaceClient | None:
+    hit = _remote_clients.get(workspace_id)
+    if hit is None:
+        return None
+    built_at, client = hit
+    if time.monotonic() - built_at >= _CLIENT_TTL_SECONDS:
+        _remote_clients.pop(workspace_id, None)
+        return None
+    return client
 
 
 def _normalize_host(host: str) -> str:
@@ -108,7 +125,7 @@ def build_remote_client(conn: dict, client_secret: str | None = None) -> Workspa
     """
     workspace_id = conn["workspace_id"]
     if client_secret is None:
-        cached = _remote_clients.get(workspace_id)
+        cached = _get_cached_client(workspace_id)
         if cached is not None:
             return cached
         client_secret = _read_secret(conn["secret_scope"], conn["secret_key"])
@@ -122,7 +139,7 @@ def build_remote_client(conn: dict, client_secret: str | None = None) -> Workspa
     client = WorkspaceClient(config=cfg, product=PRODUCT_NAME, product_version=PRODUCT_VERSION)
     # Only cache clients built from the persisted secret (not ad-hoc validation).
     if conn.get("secret_key"):
-        _remote_clients[workspace_id] = client
+        _remote_clients[workspace_id] = (time.monotonic(), client)
     return client
 
 
@@ -143,6 +160,8 @@ def validate_connection(client: WorkspaceClient) -> dict:
         return result
 
     # Best-effort probe: can the SP read system tables (needed for monitoring)?
+    # Keep the clean "Authenticated" success detail; the raw SDK exception is
+    # logged, not surfaced to the UI, and the boolean flag carries the state.
     try:
         list(client.catalogs.list())
         # A cheap system-schema check.
@@ -150,10 +169,8 @@ def validate_connection(client: WorkspaceClient) -> dict:
         result["system_tables"] = True
     except Exception as e:
         result["system_tables"] = False
-        result["detail"] = (
-            "Authenticated, but system tables are not readable "
-            f"(monitoring will be limited): {e}"
-        )
+        result["detail"] = "Authenticated — system tables not readable (monitoring will be limited)"
+        logger.info("system-table probe failed for remote workspace: %s", e)
     return result
 
 
@@ -290,7 +307,14 @@ async def test_connection(workspace_id: str) -> dict:
 
 
 async def get_client_for_workspace(workspace_id: str) -> WorkspaceClient | None:
-    """Return a cached/built remote client for a workspace_id, or None."""
+    """Return a cached/built remote client for a workspace_id, or None.
+
+    Fast path: if a live cached client exists, return it without a Lakebase
+    round-trip (this runs on the hot path for every targeted request).
+    """
+    cached = _get_cached_client(workspace_id)
+    if cached is not None:
+        return cached
     conn = await lakebase.get_workspace_connection(workspace_id)
     if not conn:
         return None

@@ -65,10 +65,18 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     try {
       const list = await listWorkspaces()
       setWorkspaces(list)
-      // If the stored selection no longer exists, fall back to home.
-      setSelectedWorkspaceId((prev) =>
-        prev && !list.some((w) => w.workspace_id === prev) ? null : prev,
-      )
+      // If the stored selection no longer exists (deleted, or caller is no
+      // longer an admin so the list is empty), fall back to home — and correct
+      // the api-layer singleton immediately so requests stop carrying the stale
+      // id without waiting for the render effect.
+      setSelectedWorkspaceId((prev) => {
+        const valid = prev && list.some((w) => w.workspace_id === prev) ? prev : null
+        setActiveWorkspaceId(valid)
+        if (!valid && prev) {
+          try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
+        }
+        return valid
+      })
     } catch {
       setWorkspaces([])
     } finally {

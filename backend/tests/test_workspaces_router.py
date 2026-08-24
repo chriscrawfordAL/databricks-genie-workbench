@@ -23,7 +23,9 @@ def client(monkeypatch) -> TestClient:
     return TestClient(app)
 
 
-def test_list_returns_connections_without_secrets(client, monkeypatch):
+def test_list_returns_connections_without_secrets_for_admin(client, monkeypatch):
+    monkeypatch.setattr(wr, "is_workspace_admin", lambda **kw: True)
+
     async def fake_list():
         return [{
             "workspace_id": "ws_1", "name": "Prod", "host": "https://h",
@@ -39,8 +41,26 @@ def test_list_returns_connections_without_secrets(client, monkeypatch):
     assert "secret_key" not in body[0] and "secret_scope" not in body[0]
 
 
+def test_list_is_empty_for_non_admin(client, monkeypatch):
+    # Non-admins get an empty list (hides the switcher) and never hit the service.
+    monkeypatch.setattr(wr, "is_workspace_admin", lambda **kw: False)
+
+    called = {"n": 0}
+    async def fake_list():
+        called["n"] += 1
+        return [{"workspace_id": "ws_1", "name": "P", "host": "h", "client_id": "c",
+                 "status": "active", "status_detail": None, "created_by": None,
+                 "created_at": None, "updated_at": None}]
+    monkeypatch.setattr(wr.ws_service, "list_connections", fake_list)
+
+    resp = client.get("/api/workspaces")
+    assert resp.status_code == 200
+    assert resp.json() == []
+    assert called["n"] == 0
+
+
 def test_create_requires_admin(client, monkeypatch):
-    monkeypatch.setattr(wr, "_is_admin_via_sdk", lambda: False)
+    monkeypatch.setattr(wr, "is_workspace_admin", lambda **kw: False)
 
     resp = client.post("/api/workspaces", json={
         "name": "Prod", "host": "https://h", "client_id": "cid", "client_secret": "sek",
@@ -49,8 +69,8 @@ def test_create_requires_admin(client, monkeypatch):
     assert "Admin access required" in resp.json()["detail"]
 
 
-def test_create_allowed_for_admin_via_sdk(client, monkeypatch):
-    monkeypatch.setattr(wr, "_is_admin_via_sdk", lambda: True)
+def test_create_allowed_for_admin(client, monkeypatch):
+    monkeypatch.setattr(wr, "is_workspace_admin", lambda **kw: True)
 
     async def fake_create(**kwargs):
         return {
@@ -67,28 +87,8 @@ def test_create_allowed_for_admin_via_sdk(client, monkeypatch):
     assert resp.json()["workspace_id"] == "ws_new"
 
 
-def test_create_allowed_via_forwarded_groups_header(client, monkeypatch):
-    # Even if the SDK check is unavailable, the forwarded admins group grants access.
-    monkeypatch.setattr(wr, "_is_admin_via_sdk", lambda: False)
-
-    async def fake_create(**kwargs):
-        return {
-            "workspace_id": "ws_h", "name": kwargs["name"], "host": kwargs["host"],
-            "client_id": kwargs["client_id"], "status": "active", "status_detail": None,
-            "created_by": None, "created_at": None, "updated_at": None,
-        }
-    monkeypatch.setattr(wr.ws_service, "create_connection", fake_create)
-
-    resp = client.post(
-        "/api/workspaces",
-        json={"name": "P", "host": "https://h", "client_id": "c", "client_secret": "s"},
-        headers={"X-Forwarded-Groups": "users,admins"},
-    )
-    assert resp.status_code == 200
-
-
 def test_create_maps_value_error_to_400(client, monkeypatch):
-    monkeypatch.setattr(wr, "_is_admin_via_sdk", lambda: True)
+    monkeypatch.setattr(wr, "is_workspace_admin", lambda **kw: True)
 
     async def fake_create(**kwargs):
         raise ValueError("Authentication failed: bad secret")

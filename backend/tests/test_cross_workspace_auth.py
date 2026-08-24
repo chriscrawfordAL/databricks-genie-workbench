@@ -94,3 +94,47 @@ def test_target_beats_obo(home_client, target_client):
         assert auth.get_workspace_client() is target_client
     finally:
         auth._obo_client.reset(token)
+
+
+# ── is_workspace_admin ─────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clear_admin_cache():
+    auth._admin_cache.clear()
+    yield
+    auth._admin_cache.clear()
+
+
+def test_admin_via_forwarded_groups_fast_path(monkeypatch):
+    monkeypatch.setattr(auth, "is_running_on_databricks_apps", lambda: True)
+    # Must not need the SDK when the admins group is forwarded.
+    monkeypatch.setattr(auth, "_is_admin_via_sdk", lambda: (_ for _ in ()).throw(AssertionError("SDK not needed")))
+    assert auth.is_workspace_admin(forwarded_groups="users,admins", forwarded_email="a@x") is True
+
+
+def test_dev_bypass_only_off_apps(monkeypatch):
+    monkeypatch.setenv("DEV_USER_EMAIL", "dev@x")
+    # On Apps: DEV_USER_EMAIL must NOT grant admin — fall through to SDK.
+    monkeypatch.setattr(auth, "is_running_on_databricks_apps", lambda: True)
+    monkeypatch.setattr(auth, "_is_admin_via_sdk", lambda: False)
+    assert auth.is_workspace_admin(forwarded_groups="", forwarded_email="dev@x") is False
+
+    # Off Apps: the DEV hatch applies.
+    auth._admin_cache.clear()
+    monkeypatch.setattr(auth, "is_running_on_databricks_apps", lambda: False)
+    assert auth.is_workspace_admin(forwarded_groups="", forwarded_email="dev@x") is True
+
+
+def test_admin_sdk_result_is_cached(monkeypatch):
+    monkeypatch.setattr(auth, "is_running_on_databricks_apps", lambda: True)
+    calls = {"n": 0}
+
+    def fake_sdk():
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(auth, "_is_admin_via_sdk", fake_sdk)
+    assert auth.is_workspace_admin(forwarded_email="u@x") is True
+    assert auth.is_workspace_admin(forwarded_email="u@x") is True
+    assert calls["n"] == 1  # second call served from cache

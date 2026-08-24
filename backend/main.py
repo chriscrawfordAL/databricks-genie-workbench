@@ -133,12 +133,22 @@ class OBOAuthMiddleware(BaseHTTPMiddleware):
     async def _maybe_set_target(self, request: Request) -> None:
         """Resolve the X-Target-Workspace header into a remote client, if present.
 
-        Connection-management endpoints (/api/workspaces/*) always run against
-        the home workspace (secrets + Lakebase), so we never apply a target
-        there. An unknown/stale workspace id falls back to home.
+        Cross-workspace targeting is admin-only: because a remote target runs
+        calls as the remote service principal (no per-user OBO scoping), we
+        honor the header only for workspace admins. Connection-management
+        endpoints (/api/workspaces/*) always run against the home workspace
+        (secrets + Lakebase), so we never apply a target there. An unknown/stale
+        workspace id falls back to home.
         """
         workspace_id = request.headers.get("x-target-workspace", "").strip()
         if not workspace_id or request.url.path.startswith("/api/workspaces"):
+            return
+        from backend.services.auth import is_workspace_admin
+        if not is_workspace_admin(
+            forwarded_groups=request.headers.get("X-Forwarded-Groups", ""),
+            forwarded_email=request.headers.get("X-Forwarded-User") or request.headers.get("X-Forwarded-Email") or "",
+        ):
+            logger.warning("Non-admin requested target workspace '%s' — ignoring, using home", workspace_id)
             return
         try:
             from backend.services import workspaces as ws_service

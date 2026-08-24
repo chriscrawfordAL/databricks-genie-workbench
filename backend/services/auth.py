@@ -11,6 +11,7 @@ Locally, falls back to PAT token or CLI profile (singleton client).
 import contextvars
 import logging
 import os
+import time
 from contextvars import ContextVar
 
 from databricks.sdk import WorkspaceClient
@@ -227,6 +228,58 @@ def get_llm_api_key() -> str:
     """Get the API key for LLM serving endpoints (always the home workspace)."""
     client = get_home_workspace_client()
     return client.config.token or os.environ.get("DATABRICKS_TOKEN", "")
+
+
+# ── Workspace-admin check (for cross-workspace authorization) ──────────────
+# Cross-workspace targeting and connection management are admin-only. Admin
+# status is resolved from the caller's *home* identity and cached per user
+# (TTL) so we don't issue a SCIM call on every request.
+_admin_cache: dict[str, tuple[float, bool]] = {}
+_ADMIN_CACHE_TTL = 300  # seconds
+
+
+def _is_admin_via_sdk() -> bool:
+    """Check workspace-admin membership via SCIM using the home OBO client.
+
+    Databricks Apps does not reliably forward an ``X-Forwarded-Groups`` header,
+    so header-only detection rejects real admins. We read the caller's own SCIM
+    record (home identity, never a remote target) and look for the workspace
+    ``admins`` group.
+    """
+    try:
+        me = get_home_workspace_client().current_user.me()
+        for g in (me.groups or []):
+            name = (getattr(g, "display", None) or getattr(g, "value", "") or "")
+            if name.lower() == "admins":
+                return True
+    except Exception:
+        logger.warning("SDK admin check failed", exc_info=True)
+    return False
+
+
+def is_workspace_admin(*, forwarded_groups: str = "", forwarded_email: str = "") -> bool:
+    """Whether the current caller is a workspace admin.
+
+    Order: local-dev escape hatch (only when NOT on Databricks Apps), then the
+    forwarded ``admins`` group (fast path), then a cached SCIM lookup. The DEV
+    hatch is gated on ``not is_running_on_databricks_apps()`` so a stray
+    DEV_USER_EMAIL/DEV_ADMIN in a real deployment can never grant admin.
+    """
+    if not is_running_on_databricks_apps():
+        if os.environ.get("DEV_ADMIN", "").lower() == "true" or os.environ.get("DEV_USER_EMAIL"):
+            return True
+
+    if "admins" in (forwarded_groups or "").lower():
+        return True
+
+    key = forwarded_email or "<obo>"
+    now = time.monotonic()
+    hit = _admin_cache.get(key)
+    if hit is not None and now - hit[0] < _ADMIN_CACHE_TTL:
+        return hit[1]
+    result = _is_admin_via_sdk()
+    _admin_cache[key] = (now, result)
+    return result
 
 
 def run_in_context(fn, *args, **kwargs):

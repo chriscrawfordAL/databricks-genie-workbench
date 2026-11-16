@@ -1,6 +1,6 @@
 ---
 sidebar_position: 3
-description: "First-time setup, deploy commands, Lakebase, and the configuration reference."
+description: "First-time setup, deploy commands, app state storage, and the configuration reference."
 ---
 
 # Deployment Guide
@@ -20,8 +20,7 @@ A Databricks workspace with:
 
 - Apps enabled
 - A SQL Warehouse (Serverless recommended)
-- A Unity Catalog with CREATE SCHEMA permission
-- Lakebase Autoscaling available (optional but recommended for persistent scan history, starred agents, and agent sessions)
+- A Unity Catalog with CREATE SCHEMA permission. The app keeps its state (scan history, stars, settings, agent sessions) in a Delta table in a catalog and schema you choose, either at install or in the app's Setup dialog. See [App State Storage](/docs/platform/storage)
 - Databricks Foundation Model APIs enabled for the curated Create Agent and Auto-Optimize model list
 - Unity AI Gateway available in the workspace's region. LLM calls go through the gateway by default so their cost is attributed in `system.ai_gateway.usage`; both installers send one test request and stop with guidance if it fails. To use the serving endpoints directly instead, install with `llm_route` set to `classic`
 
@@ -37,7 +36,7 @@ On-Behalf-Of User Authorization is what lets the app act as the signed-in user (
 
 ### Installer permissions
 
-The installer creates apps, UC objects, Lakebase projects, MLflow experiments, and jobs, and grants the app service principal across all of them. **The person running the installer typically needs workspace-admin equivalents.** If you are uncertain, have a workspace admin run the installer. The `servicePrincipal.user` role on the app service principal is not required: without it, the app sets the optimization job's `run_as` at startup. The installer grants the app access to Genie Agents, not to the data they reference: the Auto-Optimize tab checks the app service principal's read access per agent, and a run refuses to start on a schema it cannot read. See [Authentication & Permissions](/docs/platform/authentication) for the full entitlement list.
+The installer creates apps, UC objects (including the app-state schema when you set a state location), MLflow experiments, and jobs, and grants the app service principal across all of them. **The person running the installer typically needs workspace-admin equivalents.** If you are uncertain, have a workspace admin run the installer. The `servicePrincipal.user` role on the app service principal is not required: without it, the app sets the optimization job's `run_as` at startup. The installer grants the app access to Genie Agents, not to the data they reference: the Auto-Optimize tab checks the app service principal's read access per agent, and a run refuses to start on a schema it cannot read. See [Authentication & Permissions](/docs/platform/authentication) for the full entitlement list.
 
 ### Method 1 (notebook) prerequisites
 
@@ -79,8 +78,8 @@ Open `notebooks/install.py`, attach a **Serverless** compute session (**environm
 | `app_name` | Yes | Databricks App name to create or update |
 | `catalog` | Yes | Unity Catalog where the optimizer writes its tables and artifacts |
 | `warehouse_id` | Yes | Serverless SQL Warehouse ID used by the app and GSO |
-| `lakebase_mode` | Yes | `create`, `existing`, or `skip` |
-| `lakebase_project_name` | Conditional | Lakebase project name for `create` or `existing`; for `create`, blank keeps the project an existing app already uses, or `<app-name>-lakebase` for a new app. Leave blank when `lakebase_mode` is `skip` |
+| `state_catalog` | No | Catalog for the app's Delta state table. Blank leaves the choice to an admin in the app's Setup dialog |
+| `state_schema` | No | Schema for the state table (default `genie_workbench_state`). The installer creates it and grants the app access when `state_catalog` is set |
 | `llm_route` | No | `gateway` (default) sends LLM calls through Unity AI Gateway; `classic` calls the serving endpoints directly. There is no automatic fallback between them |
 | `release_check` | No | `auto` (default) turns the [daily release check](#release-update-check) on for a new app; for an existing app it keeps the previous answer, or asks users on the Admin tab if there was none. `yes` / `no` set it explicitly |
 
@@ -98,7 +97,7 @@ The installer uses the shared `scripts.deploy_lib` Python library and notebook-n
 1. Creates or updates the Databricks App and resolves its service principal, then, on the `gateway` route, sends one test request to Unity AI Gateway and stops with guidance if it fails
 2. Generates a clean source folder under `/Workspace/Users/<you>/.genie-workbench-deploy/<app-name>/app` (excluding deploy-only files, docs, tests, notebooks, `scripts/`, `.git`, `.env*`, `node_modules`, and `requirements.txt`)
 3. Provisions the UC schema, volume, GSO tables, Version Control tables/volume, CDF, and permissions
-4. Provisions or attaches Lakebase when requested
+4. Creates the app-state schema and grants the app SP access to it, when `state_catalog` is set
 5. Creates or updates the GSO optimization job (`<app-name>-gso-optimization-job`) via the SDK/Jobs API
 6. Renders a patched `app.yaml` into the generated source folder and patches app OAuth scopes and resources
 7. Deploys the app from the generated source folder
@@ -146,29 +145,21 @@ The installer will:
 5. Optionally configure MLflow tracing (creates or links an experiment)
 6. Ask whether to enable the [daily release check](#release-update-check) (default yes)
 7. Ask for app name
-8. Ask for the Lakebase Autoscaling project (create / existing / skip)
+8. Ask where the app keeps its state: a catalog and schema now, or later in the app's Setup dialog (the default)
 9. Write `.env.deploy` with your configuration (including the default LLM endpoint)
 10. Run `scripts/deploy.sh` to build and deploy the app
 11. Resolve the app's service principal
 12. Optionally grant the SP access to your existing Genie Agents
 
-## Lakebase (automated)
+## App State Storage
 
-Lakebase provides persistent storage for scan history, starred agents, and agent sessions. Without it, the app uses in-memory storage (data lost on restart).
+The app keeps its state (scan history, stars, settings, agent sessions, and more) in one Unity Catalog Delta table, `<catalog>.<schema>.workbench_state`. There is no database to provision, and no Lakebase is needed, so the app runs in regions where Lakebase is not available.
 
-**Lakebase setup is fully automated by both install paths:**
-- Creates a Lakebase Autoscaling project via the SDK
-- Creates a Postgres role for the app's service principal
-- Grants database permissions (CONNECT, CREATE ON DATABASE)
-- Attaches the `postgres` resource to the app via the Apps API
+- **Notebook path:** set the `state_catalog` and `state_schema` widgets. The installer creates the schema and grants the app access. Leave `state_catalog` blank to choose the location later in the app.
+- **Terminal path:** the installer asks in step 7. It can record `GENIE_STATE_CATALOG` and `GENIE_STATE_SCHEMA` in `.env.deploy`, and `grant_permissions.py` then creates and grants the schema.
+- **Either path:** if you leave the location blank, a workspace admin chooses it in the app's Setup dialog the first time they open the app.
 
-The app creates the `genie` schema and tables on first startup. Since the SP executes the DDL, it owns all objects — no manual grants needed.
-
-The notebook path reads the Lakebase project from the `lakebase_mode` / `lakebase_project_name` widgets. The local terminal path asks for a project name (defaults to the app name, stored as `GENIE_LAKEBASE_INSTANCE` in `.env.deploy`). No manual steps required for either.
-
-:::note
-The GRANT step requires `psycopg[binary]` in the project venv (installed by `uv sync`). If unavailable, the script prints the commands to run manually in the Lakebase SQL Editor.
-:::
+Until a location is set, the app works in memory only and its state is lost on restart. See [App State Storage](/docs/platform/storage) for the details, the grants, and how writes are persisted.
 
 ## Upgrading an existing install
 
@@ -185,7 +176,7 @@ Genie Workbench can tell you when a newer release is available. The check lives 
 
 **Choosing at install.** The terminal installer asks (default yes) and saves `GENIE_UPDATE_CHECK` in `.env.deploy`. The notebook installer uses the `release_check` widget. A `true` or `false` chosen at install is locked: Admin -> Settings shows the state, but it cannot be changed in the app.
 
-**Upgrading from an earlier version.** If no choice was recorded at install, anyone who opens the Admin tab sees a one-time banner until someone answers (turn the check on, or decline). With Lakebase, that answer applies to everyone using the app, and the banner says so; anyone can change it later in Admin -> Settings. Without Lakebase, each browser keeps its own answer.
+**Upgrading from an earlier version.** If no choice was recorded at install, anyone who opens the Admin tab sees a one-time banner until someone answers (turn the check on, or decline). Once the app has a state location, that answer applies to everyone using the app, and the banner says so; anyone can change it later in Admin -> Settings. Until then, each browser keeps its own answer.
 
 **Turning it off later.** Set `GENIE_UPDATE_CHECK=false` in `.env.deploy` and run `./scripts/deploy.sh --update`, or set the notebook `release_check` widget to `no` and rerun the installer.
 
@@ -227,7 +218,7 @@ This applies to **Method 2 (local terminal)**. The notebook installer runs the e
 - The bundle-managed optimization job
 
 It does **not** remove:
-- Lakebase data (the `genie` schema in `databricks_postgres`)
+- The app-state table (`<catalog>.<schema>.workbench_state`) and its schema
 - Unity Catalog schema/tables (`<catalog>.genie_space_optimizer` and its tables)
 - Genie Agent SP permissions granted during install
 - MLflow experiments created during install
@@ -248,7 +239,9 @@ Set these in `.env.deploy` or as environment variables:
 | `GENIE_LLM_MODEL` | No | `databricks-claude-sonnet-4-6` | LLM model (sent as `system.ai.*` on the gateway route; the serving endpoint name on classic) |
 | `GENIE_LLM_ROUTE` | No | `gateway` | `gateway` (Unity AI Gateway) or `classic` (serving endpoints directly) |
 | `GENIE_BYOK_ENABLED` | No | `false` | `true` accepts a Unity Catalog model id as the model on the gateway route |
-| `GENIE_LAKEBASE_INSTANCE` | No | empty | Lakebase Autoscaling project name (auto-provisioned by deploy); installer suggests `<app-name>-lakebase` |
+| `GENIE_STATE_CATALOG` | No | empty | Catalog for the app-state Delta table. Empty: an admin chooses the location in the app's Setup dialog. See [App State Storage](/docs/platform/storage) |
+| `GENIE_STATE_SCHEMA` | No | `genie_workbench_state` | Schema for the app-state table. Used only with `GENIE_STATE_CATALOG` |
+| `GENIE_WORKSPACES_SECRET_SCOPE` | No | `genie-workbench-workspaces` | Secret scope in this workspace that holds the secrets of [cross-workspace](/docs/platform/cross-workspace) service principals |
 | `GENIE_UPDATE_CHECK` | No | empty | `true` / `false` for the [daily release check](#release-update-check). Empty: users are asked on the Admin tab |
 
 ## Manual Setup (Method 2, without installer)
@@ -264,7 +257,6 @@ GENIE_CATALOG=<your-catalog-name>
 GENIE_APP_NAME=genie-workbench
 GENIE_DEPLOY_PROFILE=genie-workbench
 GENIE_LLM_MODEL=databricks-claude-sonnet-4-6
-GENIE_LAKEBASE_INSTANCE=genie-workbench
 EOF
 ```
 
@@ -345,6 +337,8 @@ git add package.json package-lock.json
 ## Related Documentation
 
 - [Operations Guide](/docs/platform/operations) — post-deploy monitoring and management
+- [App State Storage](/docs/platform/storage) — where the app keeps its state and how to set its location
+- [Cross-Workspace](/docs/platform/cross-workspace) — registering workspaces in the same account
 - [Authentication & Permissions](/docs/platform/authentication) — SP permissions granted during deploy
 - [Troubleshooting](/docs/reference/troubleshooting) — common deployment issues
 - [Environment Variables](/docs/reference/environment-variables) — full variable reference

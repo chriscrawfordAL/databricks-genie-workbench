@@ -1,50 +1,42 @@
 ---
 sidebar_position: 2
-description: "Lakebase, MLflow, monitoring, and GSO job management for a deployed instance."
+description: "App state storage, MLflow, monitoring, and GSO job management for a deployed instance."
 ---
 
 # Operations Guide
 
-This guide covers day-to-day operations for a deployed Genie Workbench instance: Lakebase management, MLflow configuration, monitoring, and GSO job management.
+This guide covers day-to-day operations for a deployed Genie Workbench instance: app state storage, MLflow configuration, monitoring, and GSO job management.
 
-## Lakebase
+## App State (Delta)
 
-### Schema and Tables
+The app keeps its state in one Unity Catalog Delta table, `<catalog>.<schema>.workbench_state`. There is no database to run or refresh credentials for. See [App State Storage](/docs/platform/storage) for the table layout, how the location is chosen, and the write behaviour.
 
-The app creates the `genie` schema and all tables on first startup (the SP owns everything it creates). Data is stored in the `databricks_postgres` database:
+| Data | Store (`store` column) |
+|------|------------------------|
+| IQ scan results and history | `scans`, `scan_history` |
+| Starred and seen agents | `stars`, `seen` |
+| Auto-Optimize run markers and removed-run tombstones | `optimization_runs`, `hidden_runs` |
+| Join advice | `join_advice` |
+| App settings (such as the release-check answer) | `app_settings` |
+| GenieWatch caches | `watch_*` |
+| Cross-workspace connections and transfer counters | `workspace_connections`, `workspace_transfer` |
+| Create Agent sessions | `agent_sessions` |
 
-| Table | Purpose |
-|-------|---------|
-| `scan_results` | IQ scan history: score, maturity, checks, findings, timestamps |
-| `starred_spaces` | User-starred agents for quick access |
-| `seen_spaces` | Tracks which agents the user has visited |
-| `optimization_runs` | Legacy optimization accuracy records (used by scanner checks 11–12) |
-| `agent_sessions` | Create agent session persistence (message history, step state) |
+All reads come from memory. Changed keys are flushed about every 15 seconds, and once more at shutdown. App settings and "remove run from history" are written before the request returns and fail if storage is unavailable.
 
-### Credential Refresh
+### Checking the state location
 
-Lakebase credentials are auto-generated via the Databricks SDK (`postgres.generate_database_credential` for autoscaling, `database.generate_database_credential` for provisioned). These OAuth tokens expire after ~1 hour, so the app recreates the asyncpg connection pool every **50 minutes** to stay ahead of expiration.
+Open **Admin** as a workspace admin. If the Setup dialog appears, no location is configured and the app is running in memory only. Complete the dialog to choose one. The saved choice is at `/Users/<app-sp-client-id>/.genie-workbench/storage.json`.
 
-### Graceful Degradation
-
-If `LAKEBASE_HOST` is not configured (no Lakebase attached), the app falls back to **in-memory dictionaries**. The app remains fully functional but:
-
-- Scan results are lost on restart
-- Starred Genie Agents are lost on restart
-- Agent sessions are lost on restart
-- The Admin Dashboard shows no historical data
-
-### Troubleshooting Lakebase
-
-Re-running your install path re-provisions the Lakebase resource, SP role, and
-grants: rerun `notebooks/install.py` (notebook path) or
-`./scripts/deploy.sh --update` (local terminal path).
+### Troubleshooting App State
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| "Failed to list spaces" | Lakebase not attached | Re-run your install path to auto-attach the postgres resource |
-| Connection errors after ~1 hour | Token refresh failed | Check app logs for credential generation errors |
-| Tables not created | SP lacks CONNECT or CREATE ON DATABASE | Re-run your install path to re-create the SP role and grants |
+| Setup dialog keeps appearing for admins | No location is saved, or the saved file is incomplete (`Saved storage setup at … is incomplete`) | Complete the Setup dialog again. If the log shows `Failed to save storage setup`, check that the app SP can write to its workspace home folder, or set `WORKBENCH_STORAGE_CONFIG_PATH` |
+| Scans, stars or sessions disappear on restart | No location configured, so the app is in memory only | Complete the Setup dialog, or set the location at install (see [Storage](/docs/platform/storage#choosing-the-location)) |
+| `Delta state store init failed` in logs | The state table or schema is missing, or a grant is missing | Check that the SP has `USE CATALOG`, `USE SCHEMA`, `CREATE TABLE`, `SELECT`, `MODIFY` on the schema. Re-run the Setup step as an admin, or rerun the installer. The app retries on later requests |
+| Scan results not persisting | Write failed, usually a warehouse or grant problem | Check logs for `Delta flush failed for '<store>'; will retry` |
+| "Remove from history" or a settings change fails | Storage is configured but unavailable, so the write is refused rather than kept in memory | Check the warehouse is running and the SP's grants, then retry |
 
 ## MLflow
 
@@ -101,9 +93,13 @@ databricks workspace list /Workspace/Users/<email>/<app-name>/backend --profile 
 | `OBO token lacks genie scope, retrying with service principal` | Genie API scope fallback triggered |
 | `user token lacks the ai-gateway scope; retrying the gateway call as the service principal` | Gateway scope fallback: the user hasn't consented to the `ai-gateway` scope, so the call runs as the SP |
 | `Gateway model unavailable/entitlement 404 for <model>` | The model doesn't exist on Unity AI Gateway, or the caller isn't entitled to it |
-| `Lakebase pool created` | Database connection established |
-| `Lakebase pool re-created (credential refresh)` | Scheduled 50-minute token refresh |
-| `Failed to persist scan result` | Lakebase write failed (check connectivity) |
+| `Delta state store ready at <catalog>.<schema>.workbench_state` | App state loaded from Delta at startup |
+| `Workbench storage not configured yet (Setup wizard pending)` | No state location yet; running in memory until the Setup dialog is completed |
+| `Delta state store init failed: … Using memory until it recovers.` | The state table could not be created or loaded; retried on later requests |
+| `Delta flush failed for '<store>'; will retry` | A flush of changed keys failed; the keys stay pending for the next flush |
+| `Final Delta flush failed` | The shutdown flush failed; writes since the last flush may be lost |
+| `Delta point read failed for <store>/<key>` | A Create Agent session could not be read from Delta; treated as absent |
+| `Saved storage setup to <path>` | The Setup dialog saved the state location |
 
 ## LLM Usage and Cost Attribution
 

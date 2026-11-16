@@ -1,6 +1,6 @@
 # Genie Workbench
 
-Genie Workbench is a Databricks App for creating, scoring, and optimizing Databricks Genie Agents. It combines a FastAPI backend, React/Vite frontend, Databricks On-Behalf-Of auth, Lakebase persistence, and the Genie Space Optimizer (GSO) benchmark pipeline.
+Genie Workbench is a Databricks App for creating, scoring, and optimizing Databricks Genie Agents. It combines a FastAPI backend, React/Vite frontend, Databricks On-Behalf-Of auth, Delta-table state persistence in Unity Catalog, and the Genie Space Optimizer (GSO) benchmark pipeline.
 
 Use it to:
 
@@ -22,14 +22,14 @@ The recommended install path is the Databricks notebook installer.
    - `app_name`
    - `catalog`
    - `warehouse_id`
-   - `lakebase_mode` (`create` / `existing` / `skip`)
-   - `lakebase_project_name`
+   - `state_catalog` (optional; blank = an admin picks the location in the app's Setup dialog)
+   - `state_schema` (optional; default `genie_workbench_state`)
    - `llm_route` (optional; `gateway` by default)
 5. Run the notebook from the top.
 
-The notebook uses notebook-native `WorkspaceClient()` auth, creates a generated deployment source folder under `/Workspace/Users/<you>/.genie-workbench-deploy/<app-name>/app`, patches `app.yaml` there, provisions UC/Lakebase/GSO resources, and deploys the Databricks App from that generated source. The Git folder remains unchanged.
+The notebook uses notebook-native `WorkspaceClient()` auth, creates a generated deployment source folder under `/Workspace/Users/<you>/.genie-workbench-deploy/<app-name>/app`, patches `app.yaml` there, provisions UC/GSO resources, and deploys the Databricks App from that generated source. The Git folder remains unchanged.
 
-For widget details, prerequisites, Lakebase behavior, updates, and troubleshooting, see [the Deployment Guide](docs/docs/getting-started/deployment-guide.md).
+For widget details, prerequisites, app state storage, updates, and troubleshooting, see [the Deployment Guide](docs/docs/getting-started/deployment-guide.md).
 
 ### Local Terminal Installer
 
@@ -72,16 +72,16 @@ Local terminal installer additionally requires:
 - uv
 - Node.js and npm
 
-Lakebase is optional, but without it scan history, starred spaces, and agent sessions are stored in memory only.
+App state (scan history, starred spaces, agent sessions, settings) lives in a Unity Catalog Delta table. Choose its location in the installer or in the app's Setup dialog.
 
 ### Installer permissions
 
-The installer creates a Databricks App, UC schema/volume/tables, a Lakebase Autoscaling project, an optional MLflow experiment, and a Jobs-managed optimization job, and grants the app's service principal across all of them. **Most installers will need workspace-admin equivalents.** At minimum, the installer needs:
+The installer creates a Databricks App, UC schema/volume/tables, an optional MLflow experiment, and a Jobs-managed optimization job, and grants the app's service principal across all of them. **Most installers will need workspace-admin equivalents.** At minimum, the installer needs:
 
 - Apps create entitlement and `CAN_MANAGE` on the resulting app
 - `CAN_USE` on the SQL warehouse
 - `USE CATALOG` + `CREATE SCHEMA` on the target catalog (and ownership / `MANAGE` to grant the SP)
-- Lakebase Autoscaling project creation and ownership (to create the Postgres role and run database `GRANT`s)
+- If you set `state_catalog`: `CREATE SCHEMA` on it, so the installer can create the app-state schema and grant the app access
 - Workspace files write for `databricks sync` and the MLflow experiment path
 - Jobs create entitlement and `CAN_MANAGE` on the GSO job
 - `CAN_MANAGE` on any Genie Agents being granted to the app SP (optional step)
@@ -100,18 +100,18 @@ Start with the [Introduction](docs/docs/getting-started/introduction.md); the ca
 
 Common references:
 
-- [Deployment Guide](docs/docs/getting-started/deployment-guide.md): notebook and local installer flows, Lakebase setup, updates, teardown
+- [Deployment Guide](docs/docs/getting-started/deployment-guide.md): notebook and local installer flows, app state storage, updates, teardown
 - [Upgrading](docs/docs/getting-started/upgrading.md): find your version, upgrade steps, what changes between versions, troubleshooting
 - [Architecture Overview](docs/docs/getting-started/architecture-overview.md): backend, frontend, persistence, deployment design
 - [Authentication & Permissions](docs/docs/platform/authentication.md): OBO vs service principal behavior and required grants
 - [Auto-Optimize](docs/docs/features/auto-optimize.md): GSO optimization pipeline
-- [Operations Guide](docs/docs/platform/operations.md): Lakebase, MLflow, app logs, GSO job operations
+- [Operations Guide](docs/docs/platform/operations.md): app state, MLflow, app logs, GSO job operations
 - [Troubleshooting](docs/docs/reference/troubleshooting.md): common install and runtime failures
 - [Environment Variables](docs/docs/reference/environment-variables.md): `app.yaml`, `.env.deploy`, and notebook widget variable flow
 
 ## Development Notes
 
-This app runs only on Databricks Apps. Do not run a local `uvicorn` server for app testing; OBO auth, Lakebase, app resources, and Unity AI Gateway are Databricks-managed runtime dependencies.
+This app runs only on Databricks Apps. Do not run a local `uvicorn` server for app testing; OBO auth, app resources, and Unity AI Gateway are Databricks-managed runtime dependencies.
 
 Dependency lock files are the source of truth and should be committed when changed:
 
@@ -130,7 +130,6 @@ Databricks support does not cover this project. For questions or bugs, open a Gi
 
 | library | description | license | source |
 |---|---|---|---|
-| asyncpg | Fast PostgreSQL client for asyncio | Apache-2.0 | https://pypi.org/project/asyncpg/ |
 | class-variance-authority | CSS class name composition utility | Apache-2.0 | https://github.com/joe-bell/cva |
 | clsx | Utility for constructing className strings | MIT | https://github.com/lukeed/clsx |
 | databricks-sdk | Databricks SDK for Python | Apache-2.0 | https://pypi.org/project/databricks-sdk/ |
@@ -140,7 +139,6 @@ Databricks support does not cover this project. For questions or bugs, open a Gi
 | mlflow | ML experiment tracking and model registry | Apache-2.0 | https://pypi.org/project/mlflow/ |
 | pandas | Data manipulation and analysis | BSD-3-Clause | https://pypi.org/project/pandas/ |
 | prism-react-renderer | Syntax highlighting with Prism for React | MIT | https://github.com/FormidableLabs/prism-react-renderer |
-| psycopg | PostgreSQL database adapter (v3) | LGPL-3.0 | https://pypi.org/project/psycopg/ |
 | pydantic | Data validation using Python type hints | MIT | https://pypi.org/project/pydantic/ |
 | pydantic-settings | Settings management with Pydantic | MIT | https://pypi.org/project/pydantic-settings/ |
 | python-dotenv | Load environment variables from .env files | BSD-3-Clause | https://pypi.org/project/python-dotenv/ |

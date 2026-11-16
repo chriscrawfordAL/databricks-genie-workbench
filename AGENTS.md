@@ -4,11 +4,11 @@ Databricks App for creating, scoring, and optimizing Genie Agents. FastAPI backe
 
 ## Critical Rules
 
-- **DO NOT run `uvicorn` locally.** The app requires Databricks OBO auth, Lakebase PostgreSQL, and model-serving endpoints that are only available inside a Databricks App.
+- **DO NOT run `uvicorn` locally.** The app requires Databricks OBO auth, its Delta state table, and model-serving endpoints that are only available inside a Databricks App.
 - **DO NOT run `databricks bundle init`.** It overwrites the project's `databricks.yml` and destroys the existing configuration.
 - **DO NOT use `npm install` in build or deploy scripts** — always use `npm ci`. `npm install` can silently upgrade packages within `^` ranges; `npm ci` enforces the exact lockfile.
 - **DO NOT edit `requirements.txt` manually.** It is generated from `uv.lock` as a pip-compatible reference but is excluded from deployment via `.databricksignore`. The platform uses `uv sync` (pyproject.toml + uv.lock) for hash-verified installs.
-- **Backend logic has offline unit tests** in `backend/tests/` (`./scripts/test.sh`, which also runs the GSO suite) — run these locally. But integration/E2E testing (auth, Lakebase, serving endpoints) is done by deploying to a real Databricks workspace, not by running the server locally.
+- **Backend logic has offline unit tests** in `backend/tests/` (`./scripts/test.sh`, which also runs the GSO suite) — run these locally. But integration/E2E testing (auth, the Delta state table, serving endpoints) is done by deploying to a real Databricks workspace, not by running the server locally.
 - **DO NOT run `pytest` without the dev extra.** `./scripts/test.sh` is the invocation; direct calls need `uv run --frozen --extra dev pytest`. Bare `uv run --frozen pytest` omits `pytest-asyncio`, which `asyncio_mode = "auto"` requires, and 12 async backend tests fail on uncollectable coroutines. Those failures are an invocation defect and must not be reported as pre-existing.
 - **`uv lock --check` fails structurally on this repo** — the GSO package version is dynamic (git-describe), so the resolved version changes on every commit and the check reports the lockfile as needing an update even on a clean tree. Expected, not drift. Verify the lockfile with `git status` on `uv.lock` instead, and never commit a `uv.lock` dirtied by a version-only re-resolve.
 
@@ -76,18 +76,24 @@ backend/
     app_info.py            # /api/admin/version, /api/admin/update-check (app version + release-check setting)
     auth.py                # /api/auth/me
     create.py              # /api/create/* (agent chat, UC discovery, wizard)
-    auto_optimize.py       # /api/auto-optimize/* (GSO engine proxy)
+    auto_optimize.py       # /api/auto-optimize/* (GSO engine proxy; remote-agent binding)
+    setup.py               # /api/setup/* (first-run app-state location; admin only)
+    workspaces.py          # /api/workspaces/* (cross-workspace connections; admin only)
+    transfer.py            # /api/transfer/* (data-transfer summary for remote workspaces; admin only)
     _validators.py         # Shared FastAPI path-param validators (e.g. RunId — uuid4-enforced)
   services/
-    auth.py                # OBO auth (ContextVar), SP fallback, WorkspaceClient mgmt
+    auth.py                # OBO auth (ContextVar), SP fallback, home/target/agent WorkspaceClient accessors, is_workspace_admin
     genie_client.py        # Databricks Genie API (fetch space, list spaces, query for SQL)
     scanner.py             # Rule-based IQ scoring engine (0-12, 12 checks, 3-tier maturity, UC-enriched)
     create_agent.py        # Multi-turn LLM agent for creating new Genie Agents
-    create_agent_session.py # Session persistence for create agent (Lakebase)
+    create_agent_session.py # Session persistence for create agent (app state store, lazy Delta reads)
     create_agent_tools.py  # Tool definitions for create agent (UC discovery, SQL, etc.)
     plan_builder.py        # Parallel plan generation — builds Genie Agent plans via concurrent LLM calls
-    gso_lakebase.py        # GSO synced table reads from Lakebase PostgreSQL
-    lakebase.py            # PostgreSQL persistence (asyncpg pool, in-memory fallback)
+    state_store.py         # App state: in-memory reads, flushed to Delta (see Delta State Store)
+    delta_store.py         # SQL access to the workbench_state Delta table on the app's warehouse
+    app_config.py          # Resolves the app state location (Setup dialog file or env)
+    workspaces.py          # Cross-workspace connections: remote SP clients, secret-scope refs
+    transfer_meter.py      # Counts bytes pulled from remote workspaces (Data Transfer tab)
     llm_utils.py           # OpenAI-compatible LLM client via Databricks serving endpoints
     model_catalog.py       # Curated list + validation of user-selectable chat serving endpoints (/api/models)
     uc_client.py           # Unity Catalog browsing (catalogs, schemas, tables)
@@ -108,8 +114,6 @@ scripts/
   test.sh                  # Run the backend pytest suite (installs dev deps if missing)
   deploy-config.sh         # Shared deploy configuration/variables
   grant_permissions.py     # Grants required permissions for app resources
-  setup_lakebase.py        # Automates Lakebase Autoscaling project, SP role, and grants
-  setup_synced_tables.py   # Sets up GSO synced tables in Lakebase
 notebooks/
   install.py               # Databricks-native installer using WorkspaceClient() and generated workspace source
 frontend/
@@ -138,8 +142,20 @@ On Databricks Apps, user identity flows via `x-forwarded-access-token` header. `
 
 The frontend consumes it via manual `fetch` + `ReadableStream` in `lib/api.ts` (not EventSource). Buffer splitting on `\n\n`.
 
-### Lakebase Persistence
-`services/lakebase.py` uses asyncpg with graceful fallback to in-memory dicts when `LAKEBASE_HOST` is not set. Supports both provisioned Lakebase and Lakebase Autoscaling — for autoscaling, uses `client.postgres.get_endpoint()` to resolve DNS and `client.postgres.generate_database_credential()` for OAuth tokens. Schema and tables are created by the app at startup via `_ensure_schema()` (the SP owns everything it creates). Lakebase project, SP role, and database-level grants (CONNECT, CREATE) are automated by `scripts/setup_lakebase.py` for the local terminal path and by `scripts.deploy_lib.lakebase` for the notebook path.
+### Delta State Store
+All app state (scans, stars, settings, join advice, GenieWatch caches, workspace connections, transfer counters, Create Agent sessions) lives in one Unity Catalog Delta table, `<catalog>.<schema>.workbench_state` (columns `store, k, v, updated_at`). Lakebase is not used.
+- `services/state_store.py` serves every read from memory. Changed keys are flushed with MERGE/DELETE about every 15 s and at shutdown. The state is loaded in a background task at startup. App settings and "hide run from history" writes are synchronous and fail closed. Create Agent sessions are not bulk-loaded; a cache miss point-reads Delta.
+- `services/delta_store.py` runs all SQL on the app's SQL warehouse as the home SP (never the target workspace, never the user).
+- `services/app_config.py` resolves the location: the Setup dialog's saved file (`/Users/<app-sp-client-id>/.genie-workbench/storage.json`, override `WORKBENCH_STORAGE_CONFIG_PATH`), then `WORKBENCH_STATE_CATALOG` / `WORKBENCH_STATE_SCHEMA`. Unconfigured, the app runs in memory only and admins see the Setup dialog.
+- `routers/setup.py` runs the Setup step with the admin's own permissions: create the schema, GRANT the app SP USE CATALOG and USE SCHEMA, CREATE TABLE, SELECT, MODIFY. The app creates the table. Terminal and notebook installs can pre-set the location (`GENIE_STATE_CATALOG` / `state_catalog`).
+
+### Cross-workspace
+Remote workspaces in the same account are connections that admins register (`services/workspaces.py`, `routers/workspaces.py`). `app_sp` mode uses the app's own SP; `custom_sp` mode stores the secret in the home secret scope and keeps only a reference in the state table.
+- Targeting is per request via the `X-Target-Workspace` header. `main.py` `_apply_target_workspace` resolves it to a remote client. Only home admins can target (403 otherwise). An unknown or broken target returns 404 or 502, and never falls back to home.
+- Remote calls run as the connection's SP. Use `get_target_client()` / `get_target_workspace_id()` for remote-aware code, and `get_home_workspace_client()` / `get_home_service_principal_client()` for home-only work (LLM, state store, secrets, GSO job). Routes under `_HOME_ONLY_PREFIXES` in `main.py` ignore the target.
+- Auto-Optimize: the job runs at home; `routers/auto_optimize.py` `_bind_remote_agent` binds the remote agent client, `_remote_job_target` requires `custom_sp`, and the metric-view and join-advisor routes are home-only (400 for remote agents).
+- GenieWatch system tables are read in the target workspace (`watch/services/system_tables.py`), and `sql_executor.get_sql_warehouse_id()` returns the connection's warehouse or an auto-detected one. `transfer_meter.py` counts remote bytes for `routers/transfer.py`.
+- Full behaviour and grants: `docs/docs/platform/cross-workspace.md`.
 
 ### LLM Calls
 All LLM calls go through Databricks model serving endpoints using OpenAI-compatible API. Model configured via `LLM_MODEL` env var (default: `databricks-claude-sonnet-4-6`). `services/model_catalog.py` exposes a curated set of chat-compatible endpoints via `/api/models` so the UI can let users override the model per Create Agent / Auto-Optimize run; `validate_chat_model()` guards those overrides. MLflow tracing is optional — controlled by `MLFLOW_EXPERIMENT_ID`.
@@ -158,7 +174,8 @@ IQ Scan (`scanner.py`) is the only analysis path — rule-based, instant, 0-12 s
 Defined in `app.yaml`. Key ones:
 - `SQL_WAREHOUSE_ID` — from app resource `sql-warehouse`
 - `LLM_MODEL` — serving endpoint name
-- `LAKEBASE_HOST`, `LAKEBASE_PORT`, `LAKEBASE_DATABASE`, `LAKEBASE_INSTANCE_NAME` — Lakebase config
+- `WORKBENCH_STATE_CATALOG`, `WORKBENCH_STATE_SCHEMA` — app state Delta location (blank = chosen in the Setup dialog)
+- `WORKSPACES_SECRET_SCOPE` — secret scope holding cross-workspace service principal secrets
 - `MLFLOW_EXPERIMENT_ID` — enables MLflow tracing (validated at startup, cleared if invalid)
 - `GENIE_TARGET_DIRECTORY` — where new spaces are created (default `/Shared/`)
 - `DEV_USER_EMAIL` — local dev only
@@ -176,7 +193,7 @@ There is no local dev server — all testing is done by syncing code to Databric
 2. Run `./scripts/deploy.sh --update` for local terminal installs, or rerun `notebooks/install.py` for notebook installs
 3. Test in the deployed Databricks App
 
-Do NOT suggest running `uvicorn` or `npm run dev` locally. The app depends on Databricks-managed resources (OBO auth, Lakebase, serving endpoints) that aren't available outside a Databricks App environment.
+Do NOT suggest running `uvicorn` or `npm run dev` locally. The app depends on Databricks-managed resources (OBO auth, the Delta state table, serving endpoints) that aren't available outside a Databricks App environment.
 
 ## Dependency Security Policy
 
@@ -260,11 +277,11 @@ git add package.json package-lock.json
 - **Root `package.json`** exists solely as a build hook for Databricks Apps. `postinstall` is a no-op. `build` checks for pre-built `frontend/dist/index.html` — if present (uploaded by `deploy.sh`), skips the rebuild; if dist is missing, runs `cd frontend && npm ci && npm run build`. This keeps CLI deploy fast while allowing workspace-folder deploys from fresh clones.
 - **Two install paths** — local terminal installs use `scripts/install.sh`/`scripts/deploy.sh`, with the optimization job managed by DABs (`databricks bundle deploy -t app`). Notebook installs use `notebooks/install.py`, generate source under `/Workspace/Users/<user>/.genie-workbench-deploy/<app-name>/app`, and manage the GSO job through SDK/Jobs API reset/update semantics. Do NOT run `databricks bundle deploy -t dev` for production — it creates prefixed orphan jobs.
 - **Databricks CLI >= 0.297.2 required** — `preflight.sh` validates this automatically.
-- **`--destroy` does not remove all resources** — it deletes the app and jobs but leaves behind: Lakebase data (`genie` schema), UC schema/tables (`<catalog>.genie_space_optimizer`), Genie Agent SP permissions, MLflow experiments, and synced tables. Clean these up manually if needed.
+- **`--destroy` does not remove all resources** — it deletes the app and jobs but leaves behind: the app state table (`<catalog>.<schema>.workbench_state`), UC schema/tables (`<catalog>.genie_space_optimizer`), Genie Agent SP permissions, and MLflow experiments. Clean these up manually if needed.
 - **`frontend/dist/` must be explicitly uploaded** with `databricks workspace import-dir` because `databricks sync --full` only uploads non-gitignored files.
 - **`requirements.txt` is databricksignored** — the platform uses `uv sync` instead of `pip install`. If you see pip dependency conflicts, verify `requirements.txt` is in `.databricksignore`.
 - **`MLFLOW_EXPERIMENT_ID` is workspace-specific** — the app validates it at startup and silently disables tracing if the experiment doesn't exist.
-- **Lakebase state is app-instance scoped** — keep the app name stable and update through the same install path (`./scripts/deploy.sh --update` locally, or rerun `notebooks/install.py`). If creating a new app instance, use a fresh Lakebase project; reusing an older app's Lakebase project can leave `genie` tables/sequences owned by the old app SP.
+- **App state is per app instance** — keep the app name stable and update through the same install path (`./scripts/deploy.sh --update` locally, or rerun `notebooks/install.py`). The state table is loaded at startup and the app SP needs grants on it, so a new app instance should get a fresh schema rather than reuse one another app wrote to. Without a configured location the app runs in memory only and admins see the Setup dialog, so check that dialog after a fresh install.
 
 ## Platform Build Strategy
 

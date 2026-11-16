@@ -14,7 +14,7 @@ Genie Workbench provides five capabilities that form a continuous improvement lo
 1. **Create** — An AI agent that walks you from business requirements through data discovery, inspection, and plan generation to a fully configured Genie Agent.
 2. **Score** — A rule-based IQ Scanner that evaluates agent quality across 12 checks and assigns a maturity tier.
 3. **Optimize** — A benchmark-driven pipeline (Auto-Optimize / GSO) that measures real accuracy, diagnoses failures, and iteratively improves the agent configuration.
-4. **Track** — Persistent history of every scan, optimization run, and configuration change, stored in Lakebase.
+4. **Track** — Persistent history of every scan, optimization run, and configuration change, stored in the app's Delta state table.
 5. **Watch** — GenieWatch reports per-Agent cost, usage, feedback, executed-resource lineage, and manager-reviewable benchmark candidate gaps.
 
 :::note
@@ -62,7 +62,7 @@ flowchart LR
 - **IQ Scanner** evaluates the agent and produces findings with recommended next steps.
 - The **[Model tab](/docs/features/semantic-model)** renders a Semantic Blueprint of the same config — tables, joins, metric views, and measures — with a [Join Advisor](/docs/features/join-advisor) that seeds data-grounded join advice into optimization.
 - **Auto-Optimize** runs a deeper benchmark-driven pipeline for accuracy improvement.
-- **Track** persists all results to Lakebase so you can see progress over time.
+- **Track** persists all results to the app's Delta state table so you can see progress over time.
 - **GenieWatch** reports how the Agent is used in production: cost, query volume, user feedback, executed tables, and repeated or unsuccessful question families that are not exact matches for existing benchmarks. Candidate gaps require manager review; GenieWatch does not add benchmarks or change the Agent.
 - The cycle repeats: after optimization, re-scan to see the updated score.
 
@@ -71,3 +71,4 @@ flowchart LR
 - [Architecture Overview](/docs/getting-started/architecture-overview) — understand how the app is built
 - [Authentication & Permissions](/docs/platform/authentication) — understand the security model
 - [Deployment Guide](/docs/getting-started/deployment-guide) — deploy the app to your workspace
+- [Cross-Workspace](/docs/platform/cross-workspace) — score, monitor and optimize agents in other workspaces of the same account

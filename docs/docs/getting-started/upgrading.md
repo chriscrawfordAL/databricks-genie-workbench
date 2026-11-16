@@ -5,7 +5,7 @@ description: "Check your version, upgrade an existing install, and fix common up
 
 # Upgrading
 
-Upgrading keeps your app, its settings, its Lakebase project, and its optimizer history. You rerun the installer you used the first time, against newer code.
+Upgrading keeps your app and its optimizer history. You rerun the installer you used the first time, against newer code. If your install predates the move from Lakebase to Delta, read [Upgrading from a Lakebase install](#upgrading-from-a-lakebase-install) first: the app's own state does not carry over.
 
 ## 1. Find your version
 
@@ -21,7 +21,7 @@ Upgrading keeps your app, its settings, its Lakebase project, and its optimizer 
 ### Notebook install
 
 1. In the Git folder, click **Pull**. If Pull reports a conflict in `notebooks/install.py`, discard your changes to `notebooks/install.py` and Pull again. Databricks edits the notebook when it runs, so Git sees a local change; discarding it loses nothing.
-2. Open `notebooks/install.py` and check that the widgets hold the values you installed with (`app_name`, `catalog`, `warehouse_id`, and the Lakebase settings). With `lakebase_mode` set to `create` and `lakebase_project_name` left blank, the installer keeps the Lakebase project the app already uses, so leave the name blank rather than guessing it.
+2. Open `notebooks/install.py` and check that the widgets hold the values you installed with (`app_name`, `catalog`, `warehouse_id`, `state_catalog`, and `state_schema`). If you chose the app's state location in the Setup dialog, leave `state_catalog` blank so the installer doesn't overwrite it.
 3. Click **Run All**.
 
 Always Pull before Run All. Running the installer without pulling redeploys the code you already have.
@@ -42,9 +42,20 @@ After either method, restart any Auto-Optimize run that was in progress during t
 
 Read every section from your starting version up.
 
+### Upgrading from a Lakebase install
+
+Earlier versions stored app state in Lakebase Postgres. Current versions store it in a Unity Catalog Delta table, and the Lakebase resource is gone.
+
+- **Old Lakebase data is not migrated.** Scan history, starred agents, seen agents, app settings and Create Agent sessions start fresh. Old sessions and scan history are not recovered.
+- **GSO run history is unaffected.** Auto-Optimize run history was always in Delta, and it remains.
+- **The `postgres` resource is dropped on redeploy.** Both installers remove the old Lakebase app resource. You don't need to detach it by hand.
+- **Set a state location.** After upgrading, choose one: set `state_catalog` and `state_schema` (notebook) or `GENIE_STATE_CATALOG` and `GENIE_STATE_SCHEMA` (terminal) before you install, or let an admin complete the Setup dialog when they first open the app. Until then the app runs in memory and loses state on restart. See [App State Storage](/docs/platform/storage).
+- **Settings are asked again.** Because app settings start fresh, the release-check question is asked once more. See the release check bullet below.
+- **Remove the old Lakebase project yourself if you no longer need it.** The installer doesn't delete it, and its data is not used by the app.
+
 ### From 0.2
 
-- **Release check.** The Admin tab can tell you when a newer release is available. After upgrading, the first person to open the Admin tab is asked whether to turn it on. With Lakebase, the answer applies to everyone using the app. To decide at install time, use the `release_check` notebook widget or `GENIE_UPDATE_CHECK` in `.env.deploy`. See [Release update check](./deployment-guide.md#release-update-check).
+- **Release check.** The Admin tab can tell you when a newer release is available. After upgrading, the first person to open the Admin tab is asked whether to turn it on. Once the app has a state location, the answer applies to everyone using the app. To decide at install time, use the `release_check` notebook widget or `GENIE_UPDATE_CHECK` in `.env.deploy`. See [Release update check](./deployment-guide.md#release-update-check).
 - **Version Control on notebook installs.** The notebook installer now creates the Version Control tables, so the Version Control tab works on notebook installs.
 - **certifi 2026.10.19.** The app now pins `certifi==2026.10.19`. From November 12, 2026, Databricks Apps blocks deployments that install certifi older than 2026.10.19, so versions before 0.2.1 can no longer be redeployed. A running app keeps running until you redeploy it.
 

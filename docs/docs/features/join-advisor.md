@@ -60,7 +60,7 @@ Seeding is a two-step handoff that keeps the advice auditable and re-validated:
 
 ```mermaid
 flowchart LR
-  A["Check candidate<br/>(Model tab)"] --> B["POST /join-advice<br/>persist seed set (Lakebase)"]
+  A["Check candidate<br/>(Model tab)"] --> B["POST /join-advice<br/>persist seed set (app state)"]
   B --> C["Trigger run<br/>proposed_join_seeds"]
   C --> D["operator_proposed_joins<br/>artifact (genie_opt_artifacts)"]
   D --> E["Optimizer prompt<br/>'validate, don't trust'"]
@@ -68,7 +68,7 @@ flowchart LR
 ```
 
 1. **Persist.** `POST /api/auto-optimize/spaces/{space_id}/join-advice` saves the
-   checked candidates to Lakebase (`join_advice`), tagged with the seeding user.
+   checked candidates to the app state store (`join_advice`), tagged with the seeding user.
    An empty `seeds` array clears the pending advice.
 2. **Carry into the run.** `trigger` passes the pending seeds as
    `proposed_join_seeds`, written best-effort as a run-scoped
@@ -96,7 +96,7 @@ flowchart LR
 - `frontend/src/components/model/blueprint/advisor.ts` — verdict thresholds,
   weak-probe confirm gate, seed payload shape
 - `backend/routers/auto_optimize.py` — `/join-candidates` and `/join-advice`
-- `backend/services/lakebase.py` — `save_join_advice` / `get_join_advice`
+- `backend/services/state_store.py` — `save_join_advice` / `get_join_advice`
 - `packages/genie-space-optimizer/src/genie_space_optimizer/integration/trigger.py`
   — writes the `operator_proposed_joins` artifact
 - `packages/genie-space-optimizer/src/genie_space_optimizer/optimization/unified_loop.py`

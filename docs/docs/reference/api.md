@@ -29,9 +29,9 @@ All API endpoints are prefixed with `/api` and served by FastAPI routers. This r
 |--------|------|------|---------|
 | <span className="badge badge--success">GET</span> | `/api/spaces` | <span className="badge badge--primary">OBO</span> | List Genie Agents with IQ scores, starred sort, filters |
 | <span className="badge badge--success">GET</span> | `/api/spaces/{space_id}` | <span className="badge badge--primary">OBO</span> | Space metadata + latest scan + star status |
-| <span className="badge badge--info">POST</span> | `/api/spaces/{space_id}/scan` | <span className="badge badge--primary">OBO</span> | Run IQ scan and persist result to Lakebase |
+| <span className="badge badge--info">POST</span> | `/api/spaces/{space_id}/scan` | <span className="badge badge--primary">OBO</span> | Run IQ scan and persist result to app state |
 | <span className="badge badge--success">GET</span> | `/api/spaces/{space_id}/history` | <span className="badge badge--primary">OBO</span> | Scan + auto-optimize run history for a space |
-| <span className="badge badge--warning">PUT</span> | `/api/spaces/{space_id}/star` | <span className="badge badge--primary">OBO</span> | Toggle starred status (Lakebase) |
+| <span className="badge badge--warning">PUT</span> | `/api/spaces/{space_id}/star` | <span className="badge badge--primary">OBO</span> | Toggle starred status (app state) |
 
 ## Admin Router (`/api/admin`)
 
@@ -85,7 +85,7 @@ All API endpoints are prefixed with `/api` and served by FastAPI routers. This r
 | <span className="badge badge--success">GET</span> | `/api/auto-optimize/runs/{run_id}/iterations` | <span className="badge badge--secondary">SP</span> | Per-iteration evaluation rows |
 | <span className="badge badge--success">GET</span> | `/api/auto-optimize/runs/{run_id}/loop-state` | <span className="badge badge--secondary">SP</span> | Optimizer controller loop state for the run |
 | <span className="badge badge--success">GET</span> | `/api/auto-optimize/runs/{run_id}/publish` | <span className="badge badge--secondary">SP</span> | Publish record and champion outcome |
-| <span className="badge badge--success">GET</span> | `/api/auto-optimize/runs/{run_id}/debug-data` | <span className="badge badge--secondary">SP</span> | Diagnostics for Lakebase vs Delta data |
+| <span className="badge badge--success">GET</span> | `/api/auto-optimize/runs/{run_id}/debug-data` | <span className="badge badge--secondary">SP</span> | Diagnostics: raw GSO Delta data sources for patches and iterations |
 | <span className="badge badge--success">GET</span> | `/api/auto-optimize/runs/{run_id}/eval-results` | <span className="badge badge--secondary">SP</span> | Native Eval-Run rows (requires `iteration` param) |
 | <span className="badge badge--success">GET</span> | `/api/auto-optimize/runs/{run_id}/question-results` | <span className="badge badge--secondary">SP</span> | Per-question results (requires `iteration` param) |
 | <span className="badge badge--success">GET</span> | `/api/auto-optimize/runs/{run_id}/patches` | <span className="badge badge--secondary">SP</span> | All patches for the run |
@@ -94,6 +94,36 @@ All API endpoints are prefixed with `/api` and served by FastAPI routers. This r
 | <span className="badge badge--success">GET</span> | `/api/auto-optimize/spaces/{space_id}/join-candidates` | <span className="badge badge--info">OBO → SP</span> | Discover data-grounded Join Advisor candidates with warehouse containment verdicts |
 | <span className="badge badge--success">GET</span> | `/api/auto-optimize/spaces/{space_id}/join-advice` | <span className="badge badge--primary">OBO</span> | Read the pending Join Advisor advice seeded for a space |
 | <span className="badge badge--info">POST</span> | `/api/auto-optimize/spaces/{space_id}/join-advice` | <span className="badge badge--primary">OBO</span> | Seed (or clear) Join Advisor advice — carried into the next run, never a config edit |
+
+## Setup Router (`/api/setup`)
+
+Admin-only. Chooses where the app keeps its state (see [App State Storage](/docs/platform/storage)). Browsing and grants run with the admin's own permissions.
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| <span className="badge badge--success">GET</span> | `/api/setup/status` | <span className="badge badge--primary">OBO (admin)</span> | Current state location, whether storage is available, and the last error |
+| <span className="badge badge--success">GET</span> | `/api/setup/catalogs` | <span className="badge badge--primary">OBO (admin)</span> | Catalogs the admin can use for the state location |
+| <span className="badge badge--success">GET</span> | `/api/setup/schemas` | <span className="badge badge--primary">OBO (admin)</span> | Schemas in a catalog for the state location |
+| <span className="badge badge--info">POST</span> | `/api/setup/configure` | <span className="badge badge--primary">OBO (admin)</span> | Create the schema if asked, grant the app SP access, create the state table, and save the choice |
+
+## Workspaces Router (`/api/workspaces`)
+
+Admin-only and always runs in the home workspace. Secrets are stored in the home secret scope and never returned. See [Cross-Workspace](/docs/platform/cross-workspace).
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| <span className="badge badge--success">GET</span> | `/api/workspaces` | <span className="badge badge--primary">OBO (admin)</span> | List registered remote workspace connections |
+| <span className="badge badge--success">GET</span> | `/api/workspaces/info` | <span className="badge badge--primary">OBO (admin)</span> | The app SP's client ID, the home host, and the secret scope, for granting access in remote workspaces |
+| <span className="badge badge--info">POST</span> | `/api/workspaces` | <span className="badge badge--primary">OBO (admin)</span> | Register a workspace (`app_sp` or `custom_sp`). Credentials are validated before anything is stored |
+| <span className="badge badge--warning">PUT</span> | `/api/workspaces/{workspace_id}` | <span className="badge badge--primary">OBO (admin)</span> | Update a connection; a new secret rotates the stored one |
+| <span className="badge badge--danger">DELETE</span> | `/api/workspaces/{workspace_id}` | <span className="badge badge--primary">OBO (admin)</span> | Remove a connection and its stored secret |
+| <span className="badge badge--info">POST</span> | `/api/workspaces/{workspace_id}/test` | <span className="badge badge--primary">OBO (admin)</span> | Probe a connection again and save its fresh status |
+
+## Transfer Router (`/api/transfer`)
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| <span className="badge badge--success">GET</span> | `/api/transfer/summary` | <span className="badge badge--primary">OBO (admin)</span> | Bytes pulled from remote workspaces, by workspace, day and category. Non-admins get an empty summary |
 
 ## GenieWatch Routers (`/api/watch`)
 

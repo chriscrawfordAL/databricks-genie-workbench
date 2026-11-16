@@ -17,7 +17,6 @@ them for the same app instance.
 | App shows blank page | `frontend/dist/` missing (gitignored, not synced) | Re-run your install path |
 | `Could not import module "backend.main"` | Source files missing on workspace | Re-run your install path (full sync) |
 | `No dependencies file found` | `pyproject.toml` / `uv.lock` not on workspace | Re-run your install path |
-| "Failed to list spaces" | Lakebase not attached | Attach a `postgres` resource in Apps UI, or re-run your install path |
 | `Catalog 'X' is not accessible` | Wrong catalog or missing permissions | Verify the `catalog` widget value (notebook) or `GENIE_CATALOG` (terminal); `databricks catalogs list --profile <profile>` |
 | `Invalid SQL warehouse resource` | Warehouse doesn't exist or no CAN_USE | `databricks warehouses list --profile <profile>` |
 | `Maximum number of apps` | Workspace hit the 300-app limit | Delete unused apps |
@@ -36,15 +35,32 @@ them for the same app instance.
 | Optimization job fails with catalog/schema access errors | SP lacks UC permissions on referenced data | Grant `SELECT` on referenced schemas to the SP |
 | "Permission denied" on scan | User lacks access to the Genie Agent | Share the agent with the user |
 
-## Lakebase Issues
+## App State (Delta) Issues
+
+See [App State Storage](/docs/platform/storage) and [Operations](/docs/platform/operations#troubleshooting-app-state) for the full picture.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| "Failed to list spaces" on first load | Lakebase not attached | Re-run your install path to auto-attach the postgres resource |
-| Connection timeouts after ~1 hour | Credential refresh failed | Check logs for `generate_database_credential` errors |
-| Tables not created on startup | SP lacks CONNECT or CREATE ON DATABASE | Re-run your install path to re-create the SP role and grants |
-| Scan results not persisting | Lakebase write failed | Check logs for `Failed to persist scan result` |
-| Agent sessions lost on restart | Lakebase not configured | Without Lakebase, sessions use in-memory storage (ephemeral) |
+| Setup dialog appears for admins | No state location is chosen yet | Complete the Setup dialog as a workspace admin, or set `state_catalog` / `GENIE_STATE_CATALOG` at install |
+| Scans, stars or agent sessions lost on restart | No state location configured, so state is in memory only | Complete the Setup dialog, or set the location at install |
+| `Delta state store init failed` in logs | The state table or schema is missing, or the app SP lacks a grant | Grant the app SP `USE CATALOG` on the catalog and `USE SCHEMA, CREATE TABLE, SELECT, MODIFY` on the schema, then wait for the next request (it retries) |
+| Scan results not persisting | Delta flush failed | Check logs for `Delta flush failed for '<store>'; will retry` and the warehouse status |
+| "Remove from history" or a settings change fails | Storage is configured but unavailable | Check the warehouse is running and the SP's grants, then retry |
+
+## Cross-Workspace Issues
+
+See [Cross-Workspace](/docs/platform/cross-workspace) for registration and the required grants.
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `403` "Only workspace admins can work in other workspaces." | The caller is not a home-workspace admin | Use an admin account, or switch back to the home workspace |
+| `404` "The selected workspace is no longer registered." | The connection was removed while it was selected | Switch back to the home workspace |
+| `502` "Could not connect to the selected workspace" | Authentication or network failure to the remote host | In **Admin → Workspaces**, use **Test**, then check the host and the SP's client ID and secret |
+| Connection shows **No system tables** | The remote SP cannot read system tables | Apply the system-table grants in the remote workspace |
+| Test says "no SQL warehouse visible" | The remote SP cannot see a warehouse | Grant `CAN USE` on a warehouse in the remote workspace, or set one on the connection |
+| `403` "Cert validation failed. Workspace comparison, snp system trusted…" | An account-level cross-workspace network policy (on GCP in particular) rejects the call | Requires account-level onboarding by Databricks. The app cannot work around it |
+| `400` "Metric view and join advisors are available only for agents in this app's home workspace." | The advisor routes are home-only | Use the advisors from the agent's home workspace |
+| `400` on Auto-Optimize for a remote agent | The connection is `app_sp`; remote optimization needs `custom_sp` | Register the workspace as `custom_sp` and give the remote SP `CAN MANAGE` on the agent |
 
 ## GSO / Auto-Optimize Issues
 

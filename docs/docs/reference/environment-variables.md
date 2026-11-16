@@ -55,14 +55,15 @@ The installed version itself comes from the repo-root `VERSION` file, not an env
 |----------|-------|-------------|
 | `DEV_USER_EMAIL` | (empty) | User email for local dev auth. Only used when running outside Databricks Apps |
 
-### Lakebase PostgreSQL
+### App State (Delta)
 
-| Variable | Source | Description |
-|----------|--------|-------------|
-| `LAKEBASE_HOST` | `valueFrom: postgres` | Hostname, injected from the `postgres` app resource |
-| `LAKEBASE_PORT` | `5432` | PostgreSQL port |
-| `LAKEBASE_DATABASE` | `databricks_postgres` | Database name (standard Lakebase default) |
-| `LAKEBASE_INSTANCE_NAME` | `__LAKEBASE_INSTANCE__` | Lakebase Autoscaling project name (patched by deploy script) |
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `WORKBENCH_STATE_CATALOG` | `__WORKBENCH_STATE_CATALOG__` | Catalog for the app-state table `<catalog>.<schema>.workbench_state`. Set from `GENIE_STATE_CATALOG` or the notebook `state_catalog` widget. Blank: an admin chooses the location in the Setup dialog |
+| `WORKBENCH_STATE_SCHEMA` | `__WORKBENCH_STATE_SCHEMA__` | Schema for the app-state table. Set from `GENIE_STATE_SCHEMA` or the notebook `state_schema` widget |
+| `WORKSPACES_SECRET_SCOPE` | `__WORKSPACES_SECRET_SCOPE__` | Secret scope in the home workspace holding the client secrets of cross-workspace service principals. Set from `GENIE_WORKSPACES_SECRET_SCOPE`; default `genie-workbench-workspaces` |
+
+A location saved by the Setup dialog takes precedence over these variables. The optional `WORKBENCH_STORAGE_CONFIG_PATH` variable (not set in `app.yaml`) overrides where that saved choice is kept. See [App State Storage](/docs/platform/storage).
 
 ### Auto-Optimize (GSO Engine)
 
@@ -77,7 +78,7 @@ The installed version itself comes from the repo-root `VERSION` file, not an env
 
 These variables apply to the **local terminal path only** — they are read by `deploy.sh` and written by `install.sh`. They are **not** injected into the app runtime directly; the deploy scripts use them to patch `app.yaml` placeholders and configure resources.
 
-On the recommended notebook path there is no `.env.deploy` file. The equivalent values come from `notebooks/install.py` widgets (`app_name`, `catalog`, `warehouse_id`, `lakebase_mode`, `lakebase_project_name`, `llm_route`, `release_check`). The notebook always sets `GENIE_BYOK_ENABLED` to `false`.
+On the recommended notebook path there is no `.env.deploy` file. The equivalent values come from `notebooks/install.py` widgets (`app_name`, `catalog`, `warehouse_id`, `state_catalog`, `state_schema`, `llm_route`, `release_check`). The notebook always sets `GENIE_BYOK_ENABLED` to `false`.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -89,7 +90,9 @@ On the recommended notebook path there is no `.env.deploy` file. The equivalent 
 | `GENIE_LLM_ROUTE` | No | `gateway` | `gateway` or `classic`; fills `GENIE_LLM_ROUTE` and the job's `genie_llm_route` default |
 | `GENIE_BYOK_ENABLED` | No | `false` | `true` or `false`; fills `GENIE_BYOK_ENABLED` |
 | `GENIE_UPDATE_CHECK` | No | empty | `true` or `false` for the daily release check; fills `UPDATE_CHECK_ENABLED`. Empty: users are asked on the Admin tab. Set by `install.sh` |
-| `GENIE_LAKEBASE_INSTANCE` | No | `<app-name>` | Lakebase Autoscaling project name (auto-provisioned by deploy) |
+| `GENIE_STATE_CATALOG` | No | empty | Catalog for the app-state Delta table. Empty: an admin chooses the location in the app's Setup dialog. Fills `WORKBENCH_STATE_CATALOG` |
+| `GENIE_STATE_SCHEMA` | No | `genie_workbench_state` | Schema for the app-state table. Fills `WORKBENCH_STATE_SCHEMA` |
+| `GENIE_WORKSPACES_SECRET_SCOPE` | No | `genie-workbench-workspaces` | Secret scope in this workspace for cross-workspace service principal secrets. Fills `WORKSPACES_SECRET_SCOPE` |
 
 ## How Variables Flow
 
@@ -104,9 +107,10 @@ flowchart LR
 2. The installer patches `__PLACEHOLDER__` strings in `app.yaml`. The notebook path writes the patched copy into its generated workspace source folder and leaves the Git folder's `app.yaml` untouched; the terminal path patches the file in place
 3. `databricks apps deploy` (or the notebook's equivalent SDK call) uploads the patched `app.yaml`
 4. The Databricks Apps platform injects env vars into the running container
-5. `valueFrom` variables (e.g., `LAKEBASE_HOST`, `SQL_WAREHOUSE_ID`) are resolved from app resources at runtime
+5. `valueFrom` variables (e.g., `SQL_WAREHOUSE_ID`) are resolved from app resources at runtime
 
 ## Related Documentation
 
 - [Deployment Guide](/docs/getting-started/deployment-guide) — deploy workflow and configuration
-- [Operations Guide](/docs/platform/operations) — MLflow and Lakebase management
+- [Operations Guide](/docs/platform/operations) — MLflow and app state management
+- [App State Storage](/docs/platform/storage) — the app-state table and how its location is chosen

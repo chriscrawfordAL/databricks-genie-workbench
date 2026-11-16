@@ -14,7 +14,7 @@ const rows: PermRow[] = [
   { operation: "IQ Scan (Score)", identity: "user" },
   { operation: "Trigger Auto-Optimize", identity: "both", note: "User triggers, SP executes job" },
   { operation: "Run Optimization Job", identity: "service-principal" },
-  { operation: "Read/Write Lakebase", identity: "service-principal" },
+  { operation: "Read/Write app state (Delta)", identity: "service-principal" },
 ]
 
 export function PermissionDiagram({ className }: { className?: string }) {
@@ -57,7 +57,7 @@ export function PermissionDiagram({ className }: { className?: string }) {
             </div>
           </div>
           <div className="space-y-2">
-            {["Run optimization Lakeflow Job", "Read/write Lakebase storage", "Fallback for Genie API scope gap", "Access benchmark results", "Write optimizer state", "Write publish audit artifacts"].map(
+            {["Run optimization Lakeflow Job", "Read/write app state (Delta)", "Fallback for Genie API scope gap", "Access benchmark results", "Write optimizer state", "Write publish audit artifacts"].map(
               (item) => (
                 <div key={item} className="flex items-center gap-2 text-sm text-secondary">
                   <div className="h-1.5 w-1.5 rounded-full bg-cyan shrink-0" />

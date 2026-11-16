@@ -122,8 +122,8 @@ Beyond the 12 scored checks, the scanner emits additional warnings for edge case
 
 Checks 11 and 12 evaluate optimization results. The scanner reads from two sources concurrently:
 
-1. **Lakebase** `optimization_runs` table — legacy/simple optimization records
-2. **GSO Delta tables** (`genie_opt_runs`) — Auto-Optimize pipeline runs, with fallback from Lakebase synced tables to direct Delta queries via SP
+1. **App state** `optimization_runs` store (the [Delta state table](/docs/platform/storage)) — legacy/simple optimization records
+2. **GSO Delta tables** (`genie_opt_runs`) — Auto-Optimize pipeline runs, read directly from Delta via the app service principal
 
 The scanner normalizes accuracy values (GSO stores 0–100, scanner expects 0.0–1.0) and uses the best accuracy across both sources.
 
@@ -142,7 +142,7 @@ automatic scan so the Score tab reflects the restored configuration. History
 
 ## Persistence
 
-Scan results are persisted to Lakebase (table: `scan_results`) with:
+Scan results are persisted to the app state store (`scans` and `scan_history` in the Delta state table), with:
 - `space_id`, `score`, `maturity`
 - `breakdown` (JSONB with full checks, warnings)
 - `findings`, `next_steps`
@@ -153,10 +153,9 @@ Historical scans are available via `GET /api/spaces/{id}/history`.
 ## Source Files
 
 - `packages/genie-space-optimizer/src/genie_space_optimizer/iq_scan/scoring.py` — the scoring rules (`calculate_score`, `get_maturity_label`, `CONFIG_CHECK_COUNT`), extracted from the backend so the GSO optimizer preflight shares one source of truth
-- `backend/services/scanner.py` — backend-specific IO: UC metadata enrichment, Lakebase persistence, and the async `scan_space()` orchestration
+- `backend/services/scanner.py` — backend-specific IO: UC metadata enrichment, state persistence, and the async `scan_space()` orchestration
 - `backend/routers/spaces.py` — `POST /api/spaces/{id}/scan` endpoint
-- `backend/services/lakebase.py` — persistence
-- `backend/services/gso_lakebase.py` — GSO run data for checks 11–12
+- `backend/services/state_store.py` — app state persistence (in memory, flushed to Delta); see [App State Storage](/docs/platform/storage)
 
 ## Related Documentation
 

@@ -171,7 +171,7 @@ When the LLM requests tools, the `done` event carries `needs_continuation: true`
 Agent sessions are persisted across page refreshes:
 
 - **L1 (in-memory)**: Fast access for active sessions
-- **L2 (Lakebase)**: Durable storage; sessions survive app restarts
+- **L2 (app state, Delta)**: Durable storage in the `agent_sessions` store of the [app state table](/docs/platform/storage); sessions survive app restarts once a state location is configured. A session that is not in memory is read from Delta when it is needed, not loaded at startup
 
 `backend/services/create_agent_session.py` manages the two-tier cache. Sessions store the full message history and current step, enabling reconnection via `GET /api/create/agent/sessions/{session_id}`.
 

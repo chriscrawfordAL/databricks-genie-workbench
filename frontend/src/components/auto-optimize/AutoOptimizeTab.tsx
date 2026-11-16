@@ -288,7 +288,7 @@ export function AutoOptimizeTab({
         .catch(() => {})
 
       // Poll iterations. Preserve the last non-empty set so a transient empty
-      // Lakebase/Delta read never blanks the live cockpit while the notebook is
+      // Delta read never blanks the live cockpit while the notebook is
       // between eval-run commits.
       getAutoOptimizeIterations(runId)
         .then((next) => {

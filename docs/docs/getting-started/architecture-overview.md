@@ -24,7 +24,7 @@ flowchart TB
                     rContent["analysis · spaces · admin<br/>auth · create · auto_optimize"]
                 end
                 subgraph bServices["Services"]
-                    sContent["auth · genie · llm<br/>lakebase · scanner"]
+                    sContent["auth · genie · llm<br/>app state · scanner · workspaces"]
                 end
                 subgraph bStatic["Static File Server"]
                     stContent["assets · fonts · favicon"]
@@ -40,7 +40,7 @@ flowchart TB
             end
             subgraph eRow2[" "]
                 direction LR
-                lb["Lakebase"] ~~~ mlflow["MLflow (tracing only)"] ~~~ delta["Delta (GSO state + benchmark corpus)"]
+                appstate["App state (Delta workbench_state)"] ~~~ mlflow["MLflow (tracing only)"] ~~~ delta["Delta (GSO state + benchmark corpus)"]
             end
             eRow1 ~~~ eRow2
         end
@@ -57,7 +57,7 @@ flowchart TB
     class platform gw-l0
     class backend,ext gw-l1
     class bRouters,bServices,bStatic gw-l2
-    class proxy,rContent,sContent,stContent,genie,uc,wh,ms,lb,mlflow,delta gw-node
+    class proxy,rContent,sContent,stContent,genie,uc,wh,ms,appstate,mlflow,delta gw-node
 ```
 
 ## Backend Structure
@@ -81,6 +81,11 @@ The backend is a FastAPI application (`backend/main.py`) that provides REST API 
 | `auth.py` | `/api/auth` | Current user info, health check |
 | `create.py` | `/api/create` | Create agent chat, UC discovery, wizard, session management |
 | `auto_optimize.py` | `/api/auto-optimize` | GSO trigger, run management, results, patches, and benchmark changes |
+| `setup.py` | `/api/setup` | First-run app-state location: browse catalogs and schemas, create the schema, and save the choice (admin only) |
+| `workspaces.py` | `/api/workspaces` | Register, test, update and remove cross-workspace connections (admin only) |
+| `transfer.py` | `/api/transfer` | Data-transfer summary for remote workspaces (admin only; non-admins get an empty summary) |
+
+Requests that carry `X-Target-Workspace` run against the selected remote workspace. The middleware keeps some prefixes home-only (`/api/workspaces`, `/api/setup`, `/api/transfer`, `/api/auth`, `/api/version-control`, and a few others). See [Cross-Workspace](/docs/platform/cross-workspace).
 
 ### GenieWatch subsystem (`backend/watch/`)
 
@@ -112,13 +117,16 @@ See [Appendix A: API Reference](/docs/reference/api) for the complete endpoint l
 | Scanner | `services/scanner.py` | Rule-based IQ scoring (12 checks, 3 maturity tiers) |
 | Create Agent | `services/create_agent.py` | Multi-turn tool-calling LLM agent for agent creation |
 | Create Agent Tools | `services/create_agent_tools.py` | Tool definitions: UC discovery, SQL, config generation |
-| Create Agent Session | `services/create_agent_session.py` | Session persistence (L1 in-memory + L2 Lakebase) |
+| Create Agent Session | `services/create_agent_session.py` | Session persistence: in-memory cache, backed by the app state store and read lazily from Delta |
 | Plan Builder | `services/plan_builder.py` | Parallel LLM plan generation across 5 sections |
 | LLM Utils | `services/llm_utils.py` | OpenAI-compatible chat client (`call_serving_endpoint`); the URL, model name and tags come from the LLM route |
 | LLM Route | `services/llm_route.py` | Picks Unity AI Gateway (default) or classic serving endpoints, maps model names, and builds the cost-attribution tags. The GSO package carries a byte-identical copy. See [LLM calls](#llm-calls) |
 | UC Client | `services/uc_client.py` | Unity Catalog browsing (catalogs, schemas, tables) |
-| Lakebase | `services/lakebase.py` | PostgreSQL persistence with in-memory fallback |
-| GSO Lakebase | `services/gso_lakebase.py` | GSO synced table reads from Lakebase |
+| State Store | `services/state_store.py` | App state in memory, flushed to Delta (see [App State Storage](/docs/platform/storage)) |
+| Delta Store | `services/delta_store.py` | Low-level SQL access to the `workbench_state` table on the app's SQL warehouse |
+| App Config | `services/app_config.py` | Resolves the app-state location from the Setup dialog or the environment |
+| Workspaces | `services/workspaces.py` | Cross-workspace connections: remote SP clients and secret-scope references |
+| Transfer Meter | `services/transfer_meter.py` | Counts bytes pulled from remote workspaces for the Data Transfer tab |
 | Model Catalog | `services/model_catalog.py` | Curated chat models exposed via `/api/models`; `validate_chat_model()` guards per-run overrides |
 | SQL Executor | `sql_executor.py` | SQL execution via the Databricks SQL warehouse |
 
@@ -191,11 +199,11 @@ For SSE endpoints, the OBO `ContextVar` is **not** cleared after `call_next` in 
 
 | Store | Technology | Contents |
 |-------|-----------|----------|
-| Lakebase | PostgreSQL (asyncpg) | `scan_results`, `starred_spaces`, `seen_spaces`, `optimization_runs`, `hidden_optimization_runs`, `agent_sessions`, and the GenieWatch caches (`watch_space_cache`, `watch_conversation_cache`, `watch_message_cache`, `watch_sync_watermark`, `watch_daily_usage_rollup`) |
+| App state | Unity Catalog Delta table `<catalog>.<schema>.workbench_state` | Scan results and history, stars, seen agents, optimization-run and hidden-run markers, join advice, app settings, GenieWatch caches, cross-workspace connections, transfer counters, and Create Agent sessions. Rows are keyed by `store` and `k` |
 | Delta Tables | Unity Catalog | GSO optimization state plus the direct `genie_benchmarks_<domain>` corpus handoff under `GSO_CATALOG.GSO_SCHEMA` |
 | MLflow | Tracing | LLM call traces only; no Dataset, run-tracking, model-registry, or evaluation dependency |
 
-Lakebase degrades gracefully to in-memory dictionaries when `LAKEBASE_HOST` is not configured, making the app functional (but non-persistent) without a database.
+App state is held in memory for reads and flushed to the Delta table about every 15 seconds. Until a location is configured, it stays in memory only and is lost on restart. See [App State Storage](/docs/platform/storage).
 
 ### LLM calls
 
@@ -227,7 +235,7 @@ Two gateway responses get special handling:
 
 ## Key Design Decisions
 
-1. **No local dev server** — the app depends on Databricks OBO auth, Lakebase, and Unity AI Gateway, which are only available inside a Databricks App environment. All testing is done by deploying to a real workspace.
+1. **No local dev server** — the app depends on Databricks OBO auth, its Delta state table, and Unity AI Gateway, which are only available inside a Databricks App environment. All testing is done by deploying to a real workspace.
 
 2. **Two install paths** — the recommended notebook path (`notebooks/install.py`) provisions the app and the GSO job entirely through the SDK/Jobs API, deploying from a generated workspace source folder. The local terminal path uses `deploy.sh` for the app (create, sync, `databricks apps deploy`) with the GSO job managed by DABs (`databricks bundle deploy -t app`). Do not mix the two paths for one app instance. See the [Deployment Guide](/docs/getting-started/deployment-guide).
 
@@ -240,4 +248,6 @@ Two gateway responses get special handling:
 ## Next Steps
 
 - [Authentication & Permissions](/docs/platform/authentication) — the dual auth model in detail
+- [App State Storage](/docs/platform/storage) — where the app keeps its state
+- [Cross-Workspace](/docs/platform/cross-workspace) — working with agents in other workspaces of the same account
 - [API Reference](/docs/reference/api) — complete endpoint listing

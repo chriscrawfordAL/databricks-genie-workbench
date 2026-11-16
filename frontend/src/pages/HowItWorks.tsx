@@ -499,10 +499,10 @@ function ArchitectureContent() {
     },
     {
       name: "Persistence",
-      desc: "Lakebase (PostgreSQL) + Delta Tables",
+      desc: "Unity Catalog Delta Tables",
       color: SUCCESS,
       icon: <HardDrive className="h-5 w-5" />,
-      items: ["Scans, stars, sessions in Lakebase", "Optimization state in 12 Delta tables", "Graceful fallback to in-memory storage"],
+      items: ["Scans, stars, sessions in a Delta state table", "Optimization state in 12 Delta tables", "Graceful fallback to in-memory storage"],
     },
     {
       name: "Integrations",
@@ -558,7 +558,7 @@ function ArchitectureContent() {
             { icon: <Globe className="h-5 w-5" />, label: "Browser", description: "React SPA", color: CYAN },
             { icon: <Box className="h-5 w-5" />, label: "FastAPI", description: "OBO middleware", color: ACCENT },
             { icon: <Database className="h-5 w-5" />, label: "Genie API", description: "Agent CRUD", color: INFO },
-            { icon: <HardDrive className="h-5 w-5" />, label: "Lakebase", description: "State storage", color: SUCCESS },
+            { icon: <HardDrive className="h-5 w-5" />, label: "Delta", description: "State storage", color: SUCCESS },
             { icon: <Network className="h-5 w-5" />, label: "Unity Catalog", description: "Data governance", color: WARNING },
           ]}
         />

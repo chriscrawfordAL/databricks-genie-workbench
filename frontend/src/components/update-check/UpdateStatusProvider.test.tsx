@@ -144,7 +144,7 @@ it('keeps one GitHub request in flight', async () => {
   expect(state().latest).toBe('0.2.2')
 })
 
-it('without Lakebase the answer is kept in this browser and the check starts', async () => {
+it('without durable storage the answer is kept in this browser and the check starts', async () => {
   api.getAppVersion.mockResolvedValue(info({ mode: 'ask', source: 'none', persisted: false }))
   api.setUpdateCheck.mockResolvedValue({ mode: 'on', source: 'app', locked: false, persisted: false })
   const fetchMock = vi.fn(async () => okResponse(RELEASE))

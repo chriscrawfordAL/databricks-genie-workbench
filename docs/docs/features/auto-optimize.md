@@ -352,8 +352,9 @@ disappears for everyone from Optimization History and the unified History
 chart. This is a Workbench display tombstone: it does not change the live Genie
 Agent, delete the Databricks workflow run, or purge GSO Delta audit records.
 The action requires `CAN_EDIT` or `CAN_MANAGE` on the Agent and is unavailable
-while the selected run is active. Lakebase must be available so the removal is
-durable across app restarts.
+while the selected run is active. The removal is written to the app state store
+before the request returns, so it is durable across app restarts. If the state
+store is unavailable, the request fails and nothing is hidden.
 
 ## Permission model
 
@@ -362,6 +363,8 @@ The app service principal owns optimizer Delta state and executes the Lakeflow J
 The SP also needs read access (`USE CATALOG`, `USE SCHEMA`, `SELECT`) to every schema the Agent references. The Auto-Optimize tab shows the missing GRANTs and disables Start until they are in place, including for a schema whose grants it could not read. The trigger endpoint enforces the same check for callers that skip the UI: it refuses with a 403, before any run is recorded, when a schema is definitely not granted, and proceeds with a logged warning when the Grants API cannot answer.
 
 See [Authentication & Permissions](/docs/platform/authentication) for setup and required grants.
+
+For an agent in another workspace of the same account, the job still runs in this app's home workspace, while benchmark SQL and agent updates run in the remote workspace as a dedicated service principal. See [Cross-Workspace](/docs/platform/cross-workspace#auto-optimize-requirements).
 
 ## Durable state
 
@@ -396,10 +399,11 @@ records are keyed by run and suggestion. A registered `USER_CREATED` object is
 hosted by a sentinel advice run, preserving the same `(run_id, suggestion_id)`
 key as an `OBO_CREATED` object.
 
-Workbench stores removed-history tombstones separately in Lakebase table
-`genie.hidden_optimization_runs`; GSO audit tables remain immutable.
+Workbench stores removed-history tombstones separately, in the `hidden_runs` store of
+the app state table (see [App State Storage](/docs/platform/storage)); GSO audit tables
+remain immutable.
 
-The Workbench prefers Lakebase synced reads for UI views and falls back to direct Delta reads where needed. Mutating integration paths use the configured SQL Warehouse and SP-owned state.
+UI views read the GSO Delta tables directly through the SQL Warehouse as the app service principal. Mutating integration paths use the same warehouse and SP-owned state.
 
 ## Operator-proposed joins (Join Advisor seeds)
 

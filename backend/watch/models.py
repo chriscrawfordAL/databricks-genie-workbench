@@ -270,7 +270,7 @@ class ResourceGraph(BaseModel):
 
 
 class HealthStatus(BaseModel):
-    lakebase_available: bool
+    storage_available: bool  # Delta state store configured + loaded
     obo_active: bool
     warehouse_id: Optional[str] = None
     workspace_host: Optional[str] = None

@@ -23,6 +23,7 @@ from backend.services.auth import (
     is_running_on_databricks_apps,
     require_obo_workspace_client,
 )
+from backend.services import transfer_meter
 from backend.services.version_control import contracts as vc
 
 load_dotenv()
@@ -314,6 +315,8 @@ def _get_space_with_client(client, genie_space_id: str) -> dict:
         path=f"/api/2.0/genie/spaces/{genie_space_id}",
         query={"include_serialized_space": "true"},
     )
+    # Count bytes pulled in when this is a remote (cross-workspace) fetch.
+    transfer_meter.record_current(transfer_meter.CATEGORY_GENIE, response)
     return response
 
 
@@ -345,6 +348,7 @@ def _list_spaces_with_client(client) -> list[dict]:
         )
 
         items = response.get("spaces", [])
+        transfer_meter.record_current(transfer_meter.CATEGORY_GENIE, items)
         spaces.extend(items)
 
         page_token = response.get("next_page_token")

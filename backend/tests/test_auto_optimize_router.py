@@ -889,10 +889,6 @@ def test_iterations_endpoint_emits_phase6_counts_and_gate(monkeypatch) -> None:
         },
     ]
 
-    async def fake_lakebase(_run_id):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", fake_lakebase)
     monkeypatch.setattr(auto_optimize, "_select_iterations_delta", lambda _rid: [dict(r) for r in delta_rows])
     monkeypatch.setattr(auto_optimize, "_select_loop_state_delta", lambda _rid: [])
 
@@ -941,10 +937,6 @@ def test_benchmark_changes_endpoint_groups_by_op(monkeypatch) -> None:
          "after": '{"sql": "b"}', "reason": "normalized", "logged_at": "2026-06-25T00:02:00Z"},
     ]
 
-    async def fake_lakebase(_run_id):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_benchmark_mutations", fake_lakebase)
     monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [dict(r) for r in ledger])
 
     app = FastAPI()
@@ -1029,18 +1021,11 @@ def test_benchmark_changes_recovers_snapshot_sql_and_hides_fragment_only_changes
         },
     ]
 
-    async def fake_mutations(_run_id):
-        return ledger
-
-    async def fake_run(_run_id):
-        return {"run_id": run_id, "config_snapshot": json.dumps(snapshot)}
-
-    monkeypatch.setattr(
-        auto_optimize.gso_lakebase,
-        "load_gso_benchmark_mutations",
-        fake_mutations,
+    _route_delta(
+        monkeypatch,
+        benchmark_mutations=ledger,
+        runs=[{"run_id": run_id, "config_snapshot": json.dumps(snapshot)}],
     )
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", fake_run)
     monkeypatch.setattr(auto_optimize, "_load_latest_artifact", lambda *_a: None)
 
     app = FastAPI()
@@ -1181,10 +1166,6 @@ def test_iterations_official_accuracy_uses_num_questions_not_evaluated_count(mon
         },
     ]
 
-    async def fake_lakebase(_run_id):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", fake_lakebase)
     monkeypatch.setattr(auto_optimize, "_select_iterations_delta", lambda _rid: [dict(r) for r in delta_rows])
     monkeypatch.setattr(auto_optimize, "_select_loop_state_delta", lambda _rid: [])
 
@@ -1226,10 +1207,6 @@ def test_iterations_official_v2_reports_full_30_question_corpus(monkeypatch) -> 
         },
     ]
 
-    async def fake_lakebase(_run_id):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", fake_lakebase)
     monkeypatch.setattr(auto_optimize, "_select_iterations_delta", lambda _rid: [dict(r) for r in delta_rows])
     monkeypatch.setattr(auto_optimize, "_select_loop_state_delta", lambda _rid: [])
 
@@ -1262,6 +1239,45 @@ def _gso_client(monkeypatch) -> TestClient:
 
 
 _RUN = "12345678-1234-1234-1234-1234567890ab"
+
+
+_GSO_TABLES = (
+    "genie_opt_benchmark_mutations",
+    "genie_opt_iterations",
+    "genie_opt_patches",
+    "genie_opt_stages",
+    "genie_opt_runs",
+)
+
+
+def _route_delta(monkeypatch, *, iterations=None, **tables) -> list[str]:
+    """Serve the GSO Delta reads (the only run store now) from in-test rows.
+
+    ``tables`` maps a GSO table name (``runs``, ``stages``, ``patches``,
+    ``benchmark_mutations``, ``iterations`` → ``genie_opt_<name>``) to a list
+    of rows, or a callable taking the SQL and returning rows. Unlisted tables
+    read empty. ``iterations`` (if given) also backs ``_select_iterations_delta``.
+    Returns the list of executed SQL statements.
+    """
+    statements: list[str] = []
+    by_table = {f"genie_opt_{k}": v for k, v in tables.items()}
+
+    def fake_delta_query(sql, **_k):
+        statements.append(sql)
+        for table in _GSO_TABLES:
+            if table in sql:
+                rows = by_table.get(table, [])
+                rows = rows(sql) if callable(rows) else rows
+                return [dict(r) for r in rows]
+        return []
+
+    monkeypatch.setattr(auto_optimize, "_delta_query", fake_delta_query)
+    if iterations is not None:
+        monkeypatch.setattr(
+            auto_optimize, "_select_iterations_delta",
+            lambda _rid: [dict(r) for r in iterations],
+        )
+    return statements
 
 
 # Item 1 — 4-task DAG re-map.
@@ -1372,19 +1388,10 @@ def test_typed_terminal_reason_validates_closed_set() -> None:
 
 
 def test_status_endpoint_is_four_steps_and_typed_terminal_reason(monkeypatch) -> None:
-    async def fake_run(_rid):
-        return {
-            "run_id": _RUN, "space_id": "space-1", "status": "CONVERGED",
-            "convergence_reason": "TARGET_REACHED",
-        }
-
-    async def empty(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", fake_run)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_stages", empty)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", empty)
-    monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [])
+    _route_delta(monkeypatch, iterations=[], runs=[{
+        "run_id": _RUN, "space_id": "space-1", "status": "CONVERGED",
+        "convergence_reason": "TARGET_REACHED",
+    }])
     monkeypatch.setattr(auto_optimize, "_resolve_run_knobs", lambda _run: (0.9, 3))
 
     client = _gso_client(monkeypatch)
@@ -1400,16 +1407,7 @@ def test_status_endpoint_is_four_steps_and_typed_terminal_reason(monkeypatch) ->
 
 
 def test_status_keeps_earliest_iteration_zero_as_baseline(monkeypatch) -> None:
-    async def fake_run(_rid):
-        return {
-            "run_id": _RUN, "space_id": "space-1", "status": "CONVERGED",
-            "convergence_reason": "TARGET_REACHED",
-        }
-
-    async def empty(_rid):
-        return []
-
-    async def duplicate_iteration_zero(_rid):
+    def duplicate_iteration_zero():
         return [
             {
                 "iteration": 0, "eval_scope": "full",
@@ -1425,14 +1423,14 @@ def test_status_keeps_earliest_iteration_zero_as_baseline(monkeypatch) -> None:
             },
         ]
 
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", fake_run)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_stages", empty)
-    monkeypatch.setattr(
-        auto_optimize.gso_lakebase,
-        "load_gso_iterations",
-        duplicate_iteration_zero,
+    _route_delta(
+        monkeypatch,
+        iterations=duplicate_iteration_zero(),
+        runs=[{
+            "run_id": _RUN, "space_id": "space-1", "status": "CONVERGED",
+            "convergence_reason": "TARGET_REACHED",
+        }],
     )
-    monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [])
     monkeypatch.setattr(auto_optimize, "_resolve_run_knobs", lambda _run: (0.9, 3))
 
     client = _gso_client(monkeypatch)
@@ -1459,24 +1457,26 @@ def _kept_attach_stages():
     }]
 
 
-def _stub_run_reads(monkeypatch, *, stages):
-    async def fake_run(_rid):
-        return {"run_id": _RUN, "space_id": "space-1", "status": "CONVERGED",
-                "convergence_reason": "TARGET_REACHED"}
+_BASELINE_ITERATION = {
+    "iteration": 0, "eval_scope": "full", "eval_run_id": "eval-b",
+    "timestamp": "2026-09-29T10:00:00", "overall_accuracy": 86.67,
+    "correct_count": 13, "evaluated_count": 15, "rolled_back": False,
+}
 
-    async def iterations(_rid):
-        return [{"iteration": 0, "eval_scope": "full", "eval_run_id": "eval-b",
-                 "timestamp": "2026-09-29T10:00:00", "overall_accuracy": 86.67,
-                 "correct_count": 13, "evaluated_count": 15, "rolled_back": False}]
 
-    async def load_stages(_rid):
-        return stages
+def _stub_run_reads(monkeypatch, *, stages, iterations=(_BASELINE_ITERATION,)):
+    """Serve one converged run, its stage rows and iterations from Delta.
 
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", fake_run)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_stages", load_stages)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", iterations)
-    monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [])
+    ``stages`` is a row list or a zero-arg callable. Returns the SQL log.
+    """
     monkeypatch.setattr(auto_optimize, "_resolve_run_knobs", lambda _run: (0.9, 3))
+    return _route_delta(
+        monkeypatch,
+        iterations=list(iterations),
+        runs=[{"run_id": _RUN, "space_id": "space-1", "status": "CONVERGED",
+               "convergence_reason": "TARGET_REACHED"}],
+        stages=(lambda _sql: stages()) if callable(stages) else stages,
+    )
 
 
 def _status_with(monkeypatch, *, stages, job_progress=None):
@@ -1499,24 +1499,12 @@ def test_status_reads_the_attach_stage_even_when_the_jobs_api_answers(monkeypatc
     assert body["bestEvalScope"] == "metric_view"
 
 
-def _record_delta_sql(monkeypatch, *, stage_rows):
-    statements: list[str] = []
-
-    def fake_delta_query(sql, **_k):
-        statements.append(sql)
-        return stage_rows() if "genie_opt_stages" in sql else []
-
-    monkeypatch.setattr(auto_optimize, "_delta_query", fake_delta_query)
-    return statements
-
-
 def _stage_statements(statements):
     return [s for s in statements if "genie_opt_stages" in s]
 
 
-def test_the_poll_reads_the_attach_stage_from_delta_when_lakebase_is_off(monkeypatch) -> None:
-    _stub_run_reads(monkeypatch, stages=[])
-    statements = _record_delta_sql(monkeypatch, stage_rows=_kept_attach_stages)
+def test_the_poll_reads_only_the_attach_stage_when_the_jobs_api_answers(monkeypatch) -> None:
+    statements = _stub_run_reads(monkeypatch, stages=_kept_attach_stages)
     monkeypatch.setattr(auto_optimize, "_job_task_progress", lambda _run: (3, "Optimize"))
     body = _gso_client(monkeypatch).get(f"/api/auto-optimize/runs/{_RUN}/status").json()
     assert body["bestEvalScope"] == "metric_view"
@@ -1528,13 +1516,7 @@ def test_the_poll_reads_the_attach_stage_from_delta_when_lakebase_is_off(monkeyp
 
 
 def test_the_poll_reads_no_stages_before_a_baseline(monkeypatch) -> None:
-    _stub_run_reads(monkeypatch, stages=[])
-
-    async def no_iterations(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", no_iterations)
-    statements = _record_delta_sql(monkeypatch, stage_rows=_kept_attach_stages)
+    statements = _stub_run_reads(monkeypatch, stages=_kept_attach_stages, iterations=())
     monkeypatch.setattr(auto_optimize, "_job_task_progress", lambda _run: (3, "Optimize"))
     body = _gso_client(monkeypatch).get(f"/api/auto-optimize/runs/{_RUN}/status").json()
     assert _stage_statements(statements) == []
@@ -1542,8 +1524,7 @@ def test_the_poll_reads_no_stages_before_a_baseline(monkeypatch) -> None:
 
 
 def test_the_poll_reads_stages_once_when_the_jobs_api_is_down(monkeypatch) -> None:
-    _stub_run_reads(monkeypatch, stages=[])
-    statements = _record_delta_sql(monkeypatch, stage_rows=_kept_attach_stages)
+    statements = _stub_run_reads(monkeypatch, stages=_kept_attach_stages)
     monkeypatch.setattr(auto_optimize, "_job_task_progress", lambda _run: None)
     body = _gso_client(monkeypatch).get(f"/api/auto-optimize/runs/{_RUN}/status").json()
     assert len(_stage_statements(statements)) == 1
@@ -1557,15 +1538,6 @@ def test_status_without_an_attach_stage_is_unchanged(monkeypatch) -> None:
 
 def _run_detail_with(monkeypatch, *, stages):
     _stub_run_reads(monkeypatch, stages=stages)
-
-    async def no_rows(*_a, **_k):
-        return None
-
-    async def no_patches(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iteration_rows", no_rows)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_patches", no_patches)
     monkeypatch.setattr(auto_optimize, "get_databricks_host", lambda: "")
     resp = _gso_client(monkeypatch).get(f"/api/auto-optimize/runs/{_RUN}")
     assert resp.status_code == 200, resp.text
@@ -1594,25 +1566,18 @@ def test_run_detail_without_an_attach_stage_is_unchanged(monkeypatch) -> None:
 
 
 def test_status_endpoint_uses_latest_downstream_task_for_current_step(monkeypatch) -> None:
-    async def fake_run(_rid):
-        return {"run_id": _RUN, "space_id": "space-1", "status": "IN_PROGRESS"}
-
-    async def fake_stages(_rid):
-        return [
+    _route_delta(
+        monkeypatch,
+        iterations=[],
+        runs=[{"run_id": _RUN, "space_id": "space-1", "status": "IN_PROGRESS"}],
+        stages=[
             {"stage": "INTAKE_AND_SNAPSHOT", "status": "STARTED"},
             {"stage": "INTAKE_AND_SNAPSHOT", "status": "COMPLETE"},
             {"stage": "PREFLIGHT_STARTED", "status": "STARTED"},
             {"stage": "BENCHMARK_QC_AND_REPAIR", "status": "COMPLETE"},
             {"stage": "OPTIMIZE", "status": "STARTED"},
-        ]
-
-    async def empty(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", fake_run)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_stages", fake_stages)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", empty)
-    monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [])
+        ],
+    )
     monkeypatch.setattr(auto_optimize, "_resolve_run_knobs", lambda _run: (0.9, 3))
 
     client = _gso_client(monkeypatch)
@@ -1702,24 +1667,19 @@ def test_job_task_progress_none_on_api_error(monkeypatch) -> None:
 
 
 def test_status_endpoint_prefers_jobs_api_over_empty_stages(monkeypatch) -> None:
-    """End-to-end reproduction: Lakebase disabled, the Delta stage table reads
-    empty (the serverless-write → warehouse-read gap), yet the job is on task 3.
-    The status endpoint must report the real progress from the Jobs API instead
+    """End-to-end reproduction: the Delta stage table reads empty (the
+    serverless-write → warehouse-read gap), yet the job is on task 3. The
+    status endpoint must report the real progress from the Jobs API instead
     of the misleading 0/4 · Intake the empty stage list would produce."""
-    async def fake_run(_rid):
-        return {
+    # Stages read empty — this is exactly the frozen-rail case.
+    _route_delta(
+        monkeypatch,
+        iterations=[],
+        runs=[{
             "run_id": _RUN, "space_id": "space-1", "status": "IN_PROGRESS",
             "job_run_id": "999",
-        }
-
-    async def empty(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", fake_run)
-    # Stages read empty on BOTH paths — this is exactly the frozen-rail case.
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_stages", empty)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", empty)
-    monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [])
+        }],
+    )
     monkeypatch.setattr(auto_optimize, "_resolve_run_knobs", lambda _run: (0.9, 3))
 
     sp_ws = MagicMock()
@@ -1742,22 +1702,15 @@ def test_status_endpoint_prefers_jobs_api_over_empty_stages(monkeypatch) -> None
 
 def test_status_endpoint_falls_back_to_stages_when_no_job_run_id(monkeypatch) -> None:
     """Without a job_run_id, the endpoint keeps its Delta-stage derivation."""
-    async def fake_run(_rid):
-        return {"run_id": _RUN, "space_id": "space-1", "status": "IN_PROGRESS"}
-
-    async def fake_stages(_rid):
-        return [
+    _route_delta(
+        monkeypatch,
+        iterations=[],
+        runs=[{"run_id": _RUN, "space_id": "space-1", "status": "IN_PROGRESS"}],
+        stages=[
             {"stage": "INTAKE_AND_SNAPSHOT", "status": "COMPLETE"},
             {"stage": "BENCHMARK_QC_AND_REPAIR", "status": "STARTED"},
-        ]
-
-    async def empty(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", fake_run)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_stages", fake_stages)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", empty)
-    monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [])
+        ],
+    )
     monkeypatch.setattr(auto_optimize, "_resolve_run_knobs", lambda _run: (0.9, 3))
 
     client = _gso_client(monkeypatch)
@@ -1815,25 +1768,21 @@ def test_run_summaries_enrich_has_config_snapshot_coerced() -> None:
 
 @pytest.mark.asyncio
 async def test_hidden_runs_are_filtered_from_history_listings(monkeypatch) -> None:
-    async def load_runs(_space_id: str) -> list[dict]:
-        return [
-            {"run_id": _RUN, "status": "CONVERGED"},
-            {
-                "run_id": "87654321-4321-4321-4321-ba0987654321",
-                "status": "FAILED",
-            },
-        ]
+    monkeypatch.setenv("GSO_CATALOG", "main")
+    monkeypatch.setenv("GSO_JOB_ID", "12345")
+    _route_delta(monkeypatch, runs=[
+        {"run_id": _RUN, "status": "CONVERGED"},
+        {
+            "run_id": "87654321-4321-4321-4321-ba0987654321",
+            "status": "FAILED",
+        },
+    ])
 
     async def hidden_ids(_space_id: str) -> set[str]:
         return {_RUN}
 
     monkeypatch.setattr(
-        auto_optimize.gso_lakebase,
-        "load_gso_runs_for_space",
-        load_runs,
-    )
-    monkeypatch.setattr(
-        auto_optimize.workbench_lakebase,
+        auto_optimize.workbench_state,
         "get_hidden_optimization_run_ids",
         hidden_ids,
     )
@@ -1846,16 +1795,14 @@ async def test_hidden_runs_are_filtered_from_history_listings(monkeypatch) -> No
 
 
 def test_the_run_list_shows_the_stored_champion_accuracy(client, monkeypatch) -> None:
-    async def load_runs(_space_id: str) -> list[dict]:
-        return [{"run_id": _RUN, "status": "CONVERGED",
-                 "best_accuracy": 90.0, "best_iteration": 0}]
+    _route_delta(monkeypatch, runs=[{"run_id": _RUN, "status": "CONVERGED",
+                                     "best_accuracy": 90.0, "best_iteration": 0}])
 
     async def hidden_ids(_space_id: str) -> set[str]:
         return set()
 
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_runs_for_space", load_runs)
     monkeypatch.setattr(
-        auto_optimize.workbench_lakebase, "get_hidden_optimization_run_ids", hidden_ids,
+        auto_optimize.workbench_state, "get_hidden_optimization_run_ids", hidden_ids,
     )
 
     response = client.get("/api/auto-optimize/spaces/space-1/runs")
@@ -1884,7 +1831,7 @@ def test_remove_history_entry_persists_requesting_user(
     monkeypatch.setattr(auto_optimize, "_load_run_envelope", load_run)
     asked = _record_space_access(monkeypatch)
     monkeypatch.setattr(
-        auto_optimize.workbench_lakebase,
+        auto_optimize.workbench_state,
         "hide_optimization_run_from_history",
         hide_run,
     )
@@ -1960,11 +1907,11 @@ def test_remove_history_entry_fails_when_tombstone_cannot_be_persisted(
         return {"run_id": _RUN, "space_id": "space-1", "status": "FAILED"}
 
     async def fail_to_hide(*_args) -> None:
-        raise RuntimeError("Lakebase unavailable")
+        raise RuntimeError("Workbench storage unavailable")
 
     monkeypatch.setattr(auto_optimize, "_load_run_envelope", load_run)
     monkeypatch.setattr(
-        auto_optimize.workbench_lakebase,
+        auto_optimize.workbench_state,
         "hide_optimization_run_from_history",
         fail_to_hide,
     )
@@ -2037,10 +1984,6 @@ def test_iterations_merge_is_champion_and_config_json(monkeypatch) -> None:
          "decision": "accept", "decision_reason": "improved"},
     ]
 
-    async def empty(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", empty)
     monkeypatch.setattr(auto_optimize, "_select_iterations_delta", lambda _rid: [dict(r) for r in delta_rows])
     monkeypatch.setattr(auto_optimize, "_select_loop_state_delta", lambda _rid: [dict(r) for r in loop_rows])
 
@@ -2069,10 +2012,6 @@ def test_iterations_no_loop_state_columns_degrade_gracefully(monkeypatch) -> Non
          "rolled_back": False, "scores_json": "{}", "lever": None},
     ]
 
-    async def empty(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", empty)
     monkeypatch.setattr(auto_optimize, "_select_iterations_delta", lambda _rid: [dict(r) for r in delta_rows])
     monkeypatch.setattr(auto_optimize, "_select_loop_state_delta", lambda _rid: [])
 
@@ -2305,10 +2244,6 @@ def test_benchmark_changes_includes_qc(monkeypatch) -> None:
         "proposed_changes": [],
     }
 
-    async def empty(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_benchmark_mutations", empty)
     monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [])
     monkeypatch.setattr(auto_optimize, "_load_latest_artifact",
                         lambda _rid, kind: qc_payload if kind == "benchmark_qc" else None)
@@ -2367,10 +2302,6 @@ def test_build_benchmark_qc_maps_new_exhaustion_without_legacy_alias() -> None:
 
 
 def test_benchmark_changes_qc_null_for_legacy_run(monkeypatch) -> None:
-    async def empty(_rid):
-        return []
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_benchmark_mutations", empty)
     monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [])
     monkeypatch.setattr(auto_optimize, "_load_latest_artifact", lambda _rid, kind: None)
 
@@ -2455,18 +2386,11 @@ def test_loop_state_target_accuracy_small_value_round_trips(monkeypatch) -> None
 def test_status_echoes_knobs_from_run_manifest_pre_loop(monkeypatch) -> None:
     """A freshly-triggered run (00 wrote the manifest, loop hasn't committed an
     attempt) still echoes the knobs from the run_manifest artifact (0–1)."""
-    async def fake_run(_rid):
-        return {"run_id": _RUN, "space_id": "s", "status": "IN_PROGRESS",
-                "convergence_reason": None, "job_run_id": "555"}
-
-    async def empty(_rid):
-        return []
-
     manifest = {"run_id": _RUN, "target_accuracy": 0.85, "max_attempts": 5}
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", fake_run)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_stages", empty)
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_iterations", empty)
-    monkeypatch.setattr(auto_optimize, "_delta_query", lambda *a, **k: [])
+    _route_delta(monkeypatch, iterations=[], runs=[{
+        "run_id": _RUN, "space_id": "s", "status": "IN_PROGRESS",
+        "convergence_reason": None, "job_run_id": "555",
+    }])
     # No loop-state rows yet; manifest is present.
     monkeypatch.setattr(auto_optimize, "_load_latest_artifact",
                         lambda _rid, kind: manifest if kind == "run_manifest" else None)
@@ -2837,7 +2761,7 @@ def test_trigger_without_edit_is_refused_before_any_side_effect(client, monkeypa
     capture = MagicMock()
     monkeypatch.setattr(observe_optimizer, "capture_before", capture)
     advice = MagicMock()
-    monkeypatch.setattr(auto_optimize.workbench_lakebase, "get_join_advice", advice)
+    monkeypatch.setattr(auto_optimize.workbench_state, "get_join_advice", advice)
     asked: list = []
     _deny_space_access(monkeypatch, asked)
 
@@ -2887,7 +2811,7 @@ def test_run_mutations_without_edit_are_refused_before_any_side_effect(
     asked: list = []
     _deny_space_access(monkeypatch, asked)
     hide = MagicMock()
-    monkeypatch.setattr(auto_optimize.workbench_lakebase, "hide_optimization_run_from_history", hide)
+    monkeypatch.setattr(auto_optimize.workbench_state, "hide_optimization_run_from_history", hide)
     target = MagicMock()
     if action:
         monkeypatch.setattr(auto_optimize, action, target)
@@ -2937,25 +2861,22 @@ def test_run_gate_answers_409_for_a_run_without_a_space(client, monkeypatch) -> 
     revert_mock.assert_not_called()
 
 
-def test_run_gate_reads_the_lakebase_envelope_and_asks_its_space(monkeypatch):
-    async def lakebase_run(run_id):
-        return {"run_id": run_id, "space_id": "space-lb", "status": "CONVERGED"}
+def test_run_gate_reads_the_delta_envelope_and_asks_its_space(monkeypatch):
+    async def delta(sql, *, strict=False):
+        return [{"run_id": _RUN, "space_id": "space-lb", "status": "CONVERGED"}]
 
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", lakebase_run)
+    monkeypatch.setattr(auto_optimize, "_is_configured", lambda: True)
+    monkeypatch.setattr(auto_optimize, "_delta_query_async", delta)
     asked = _record_space_access(monkeypatch)
     run = asyncio.run(auto_optimize._require_run_space_access(_RUN, SpaceAccessLevel.EDIT))
     assert run["space_id"] == "space-lb"
     assert asked == [("space-lb", SpaceAccessLevel.EDIT)]
 
 
-def test_run_gate_503_when_the_delta_fallback_fails(monkeypatch):
-    async def miss(run_id):
-        return None
-
+def test_run_gate_503_when_the_delta_read_fails(monkeypatch):
     async def delta_down(*args, **kwargs):
         raise RuntimeError("warehouse down")
 
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", miss)
     monkeypatch.setattr(auto_optimize, "_is_configured", lambda: True)
     monkeypatch.setattr(auto_optimize, "_delta_query_async", delta_down)
     with pytest.raises(HTTPException) as caught:
@@ -2964,11 +2885,7 @@ def test_run_gate_503_when_the_delta_fallback_fails(monkeypatch):
     assert caught.value.detail == auto_optimize._RUN_ACCESS_UNAVAILABLE
 
 
-def test_run_gate_404_when_unconfigured_and_lakebase_misses(monkeypatch):
-    async def miss(run_id):
-        return None
-
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", miss)
+def test_run_gate_404_when_unconfigured(monkeypatch):
     monkeypatch.setattr(auto_optimize, "_is_configured", lambda: False)
     with pytest.raises(HTTPException) as caught:
         asyncio.run(auto_optimize._require_run_space_access(_RUN, SpaceAccessLevel.EDIT))
@@ -2978,15 +2895,10 @@ def test_run_gate_404_when_unconfigured_and_lakebase_misses(monkeypatch):
 def test_run_gate_404s_a_malformed_run_id_before_any_io(monkeypatch):
     touched: list[str] = []
 
-    async def lakebase(run_id):
-        touched.append("lakebase")
-        return {"run_id": run_id, "space_id": "space-lb", "status": "CONVERGED"}
-
     async def delta(*args, **kwargs):
         touched.append("delta")
         return []
 
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", lakebase)
     monkeypatch.setattr(auto_optimize, "_is_configured", lambda: True)
     monkeypatch.setattr(auto_optimize, "_delta_query_async", delta)
     asked = _record_space_access(monkeypatch)
@@ -2999,17 +2911,13 @@ def test_run_gate_404s_a_malformed_run_id_before_any_io(monkeypatch):
     assert asked == []
 
 
-def test_run_envelope_delta_fallback_escapes_the_run_id_literal(monkeypatch):
+def test_run_envelope_delta_read_escapes_the_run_id_literal(monkeypatch):
     captured: list[str] = []
-
-    async def miss(run_id):
-        return None
 
     async def delta(sql, *, strict=False):
         captured.append(sql)
         return []
 
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", miss)
     monkeypatch.setattr(auto_optimize, "_is_configured", lambda: True)
     monkeypatch.setattr(auto_optimize, "_delta_table", lambda name: f"c.s.{name}")
     monkeypatch.setattr(auto_optimize, "_delta_query_async", delta)

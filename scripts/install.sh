@@ -12,7 +12,7 @@ set -euo pipefail
 #   5. MLflow tracing (optional — experiment ID for agent observability)
 #      + Daily release check prompt (default yes; saved as GENIE_UPDATE_CHECK)
 #   6. Asks for app name
-#   7. Lakebase project (create new, skip, or advanced attach existing)
+#   7. App state storage (Delta tables; set now or in the app Setup dialog)
 #   8. Writes .env.deploy
 #   9. Runs deploy.sh
 #  10. Resolves app service principal
@@ -122,7 +122,7 @@ echo -e "${BOLD}║                                                             
 echo -e "${BOLD}║  Creates and configures:                                     ║${NC}"
 echo -e "${BOLD}║    • Databricks App (with OAuth scopes)                      ║${NC}"
 echo -e "${BOLD}║    • GSO Optimization Job (6-stage pipeline)                 ║${NC}"
-echo -e "${BOLD}║    • Lakebase database (PostgreSQL)                          ║${NC}"
+echo -e "${BOLD}║    • Delta state storage (Unity Catalog)                     ║${NC}"
 echo -e "${BOLD}║    • Unity Catalog permissions                               ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
@@ -576,155 +576,35 @@ done
 _ok "App name: $APP_NAME"
 
 # ══════════════════════════════════════════════════════════════════════════
-# Step 7: Lakebase (PostgreSQL)
+# Step 7: App state storage (Delta tables)
 # ══════════════════════════════════════════════════════════════════════════
-_header "Step 7: Lakebase (PostgreSQL)"
+_header "Step 7: App state storage (Delta tables)"
 
-_info "Lakebase provides persistent PostgreSQL storage for scan history, starred"
-_info "spaces, and Create Agent sessions. Without it, the app uses in-memory"
-_info "storage and all history is lost every time the app restarts."
+_info "Genie Workbench keeps its own state (scan history, stars, settings, Create"
+_info "Agent sessions, workspace connections) in a Unity Catalog Delta table."
+_info "No Lakebase/PostgreSQL is needed. By default a workspace admin picks the"
+_info "catalog and schema in the app Setup dialog the first time it opens."
 echo ""
-_warn "Genie Workbench requires Lakebase Autoscaling (Serverless). Provisioned"
-_warn "Lakebase instances are not supported."
-echo ""
-_info "Recommended: create a fresh Lakebase project for this app instance."
-_info "Reusing a Lakebase project from another app can cause ownership errors."
-echo ""
-
-_info "Discovering available Lakebase Autoscaling projects..."
-LB_NAMES=()
-while IFS= read -r name; do
-    [ -n "$name" ] && LB_NAMES+=("$name")
-done < <(
-    databricks api get /api/2.0/postgres/projects --profile "$PROFILE" -o json 2>/dev/null \
-    | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    projects = data if isinstance(data, list) else data.get('projects', [])
-    for proj in projects:
-        if isinstance(proj, dict):
-            # resource name is 'projects/<project_id>' — extract the ID
-            resource_name = proj.get('name', '')
-            project_id = resource_name.removeprefix('projects/') if resource_name else proj.get('project_id', '')
-            if project_id:
-                print(project_id)
-        else:
-            val = str(proj)
-            if val:
-                print(val)
-except: pass
-" 2>/dev/null
-)
-
-_lakebase_name_exists() {
-    local needle="$1"
-    local name
-
-    if [ "${#LB_NAMES[@]}" -eq 0 ]; then
-        return 1
-    fi
-
-    for name in "${LB_NAMES[@]}"; do
-        if [ "$name" = "$needle" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-LAKEBASE_BASE="${APP_NAME}-lakebase"
-if [[ ! "$LAKEBASE_BASE" =~ ^[a-z] ]]; then
-    LAKEBASE_BASE="genie-$LAKEBASE_BASE"
+STATE_LATER_OPTION="Choose later in the app Setup dialog (recommended)"
+STATE_NOW_OPTION="Set it now: ${CATALOG}.genie_workbench_state"
+STATE_CUSTOM_OPTION="Set it now: enter a catalog and schema"
+_select_from STATE_CHOICE "Where should the app keep its state?" 1 \
+    "$STATE_LATER_OPTION" "$STATE_NOW_OPTION" "$STATE_CUSTOM_OPTION"
+STATE_CATALOG=""
+STATE_SCHEMA=""
+if [[ "$STATE_CHOICE" == "$STATE_NOW_OPTION" ]]; then
+    STATE_CATALOG="$CATALOG"
+    STATE_SCHEMA="genie_workbench_state"
+elif [[ "$STATE_CHOICE" == "$STATE_CUSTOM_OPTION" ]]; then
+    _prompt STATE_CATALOG "Catalog for app state" "$CATALOG"
+    _prompt STATE_SCHEMA "Schema for app state" "genie_workbench_state"
 fi
-if [ "${#LAKEBASE_BASE}" -gt 63 ]; then
-    LAKEBASE_BASE="${LAKEBASE_BASE:0:63}"
-    LAKEBASE_BASE="${LAKEBASE_BASE%-}"
-fi
-DEFAULT_LAKEBASE_INSTANCE="$LAKEBASE_BASE"
-LAKEBASE_SUFFIX=2
-while _lakebase_name_exists "$DEFAULT_LAKEBASE_INSTANCE"; do
-    SUFFIX="-$LAKEBASE_SUFFIX"
-    MAX_BASE_LEN=$((63 - ${#SUFFIX}))
-    DEFAULT_LAKEBASE_INSTANCE="${LAKEBASE_BASE:0:$MAX_BASE_LEN}${SUFFIX}"
-    DEFAULT_LAKEBASE_INSTANCE="${DEFAULT_LAKEBASE_INSTANCE%-}"
-    LAKEBASE_SUFFIX=$((LAKEBASE_SUFFIX + 1))
-done
-
-CREATE_DEFAULT_OPTION="Create new Lakebase project: $DEFAULT_LAKEBASE_INSTANCE"
-CREATE_CUSTOM_OPTION="Enter a different new Lakebase project name"
-SKIP_LAKEBASE_OPTION="Skip — use in-memory fallback (history lost on restart)"
-ATTACH_EXISTING_OPTION="Advanced: attach an existing Lakebase project"
-
-LB_OPTIONS=("$CREATE_DEFAULT_OPTION" "$CREATE_CUSTOM_OPTION" "$SKIP_LAKEBASE_OPTION")
-if [ ${#LB_NAMES[@]} -gt 0 ]; then
-    LB_OPTIONS+=("$ATTACH_EXISTING_OPTION")
-fi
-
-if [ ${#LB_NAMES[@]} -gt 0 ]; then
-    _info "Existing Lakebase projects were found. Attach one only for an"
-    _info "intentional same-app reuse or after an admin ownership migration."
+if [ -n "$STATE_CATALOG" ]; then
+    _ok "App state: ${STATE_CATALOG}.${STATE_SCHEMA}.workbench_state"
+    _info "The deploy creates that schema if needed and grants the app service principal access."
 else
-    _info "No existing Lakebase Autoscaling projects found."
+    _ok "App state location will be chosen in the app Setup dialog"
 fi
-
-LAKEBASE_INSTANCE=""
-while true; do
-    _select_from LB_CHOICE "Choose Lakebase persistence" 1 "${LB_OPTIONS[@]}"
-
-    if [[ "$LB_CHOICE" == "$CREATE_DEFAULT_OPTION" ]]; then
-        LAKEBASE_INSTANCE="$DEFAULT_LAKEBASE_INSTANCE"
-        _ok "Lakebase Autoscaling project will be created: $LAKEBASE_INSTANCE"
-        break
-    elif [[ "$LB_CHOICE" == "$CREATE_CUSTOM_OPTION" ]]; then
-        echo ""
-        _info "The new Lakebase project will be created during deploy."
-        _info "Use lowercase letters, numbers, and hyphens."
-        while true; do
-            _prompt LAKEBASE_INSTANCE "New Lakebase project name"
-            if [[ ! "$LAKEBASE_INSTANCE" =~ ^[a-z]([a-z0-9-]*[a-z0-9])?$ ]]; then
-                _error "Lakebase project name must start with a lowercase letter and contain only lowercase letters, numbers, and hyphens."
-                continue
-            fi
-            if [ "${#LAKEBASE_INSTANCE}" -gt 63 ]; then
-                _error "Lakebase project name must be 63 characters or fewer."
-                continue
-            fi
-            if _lakebase_name_exists "$LAKEBASE_INSTANCE"; then
-                _error "Lakebase project '$LAKEBASE_INSTANCE' already exists. Choose the advanced attach option to reuse it, or enter a new project name."
-                continue
-            fi
-            _ok "Lakebase Autoscaling project will be created: $LAKEBASE_INSTANCE"
-            break
-        done
-        break
-    elif [[ "$LB_CHOICE" == "$SKIP_LAKEBASE_OPTION" ]]; then
-        LAKEBASE_INSTANCE=""
-        _warn "Skipping Lakebase. Scan history and stars will not persist across restarts."
-        break
-    elif [[ "$LB_CHOICE" == "$ATTACH_EXISTING_OPTION" ]]; then
-        echo ""
-        _warn "Attach an existing Lakebase project only if this is the same app"
-        _warn "instance or an admin has migrated ownership of the existing"
-        _warn "genie schema, tables, and sequences to this app's service principal."
-        _prompt_yn CONFIRM_ATTACH "Continue with existing Lakebase attachment?" "N"
-        if [ "$CONFIRM_ATTACH" != "Y" ]; then
-            echo ""
-            continue
-        fi
-        echo ""
-        _info "Available Lakebase Autoscaling projects:"
-        EXISTING_LB_OPTIONS=("${LB_NAMES[@]}" "Back to Lakebase options")
-        _select_from LAKEBASE_INSTANCE "Select existing Lakebase project" "${EXISTING_LB_OPTIONS[@]}"
-        if [[ "$LAKEBASE_INSTANCE" == "Back to Lakebase options" ]]; then
-            LAKEBASE_INSTANCE=""
-            echo ""
-            continue
-        fi
-        _ok "Lakebase Autoscaling project: $LAKEBASE_INSTANCE"
-        break
-    fi
-done
 
 # ══════════════════════════════════════════════════════════════════════════
 # Step 8: Write .env.deploy
@@ -741,7 +621,8 @@ GENIE_CATALOG="$CATALOG"
 GENIE_APP_NAME="$APP_NAME"
 GENIE_DEPLOY_PROFILE="$PROFILE"
 GENIE_LLM_MODEL="$LLM_MODEL"
-GENIE_LAKEBASE_INSTANCE="$LAKEBASE_INSTANCE"
+GENIE_STATE_CATALOG="$STATE_CATALOG"
+GENIE_STATE_SCHEMA="$STATE_SCHEMA"
 GENIE_MLFLOW_EXPERIMENT_ID="$MLFLOW_EXPERIMENT_ID"
 GENIE_UPDATE_CHECK="$UPDATE_CHECK"
 EOF
@@ -755,7 +636,11 @@ echo "  │  Catalog:      $CATALOG"
 echo "  │  GSO Schema:   ${CATALOG}.${GSO_SCHEMA} (default)"
 echo "  │  Warehouse ID: $WAREHOUSE_ID"
 echo "  │  Default LLM:  $LLM_MODEL"
-echo "  │  Lakebase:     ${LAKEBASE_INSTANCE:-<none>}"
+if [ -n "$STATE_CATALOG" ]; then
+    echo "  │  App state:    ${STATE_CATALOG}.${STATE_SCHEMA} (Delta)"
+else
+    echo "  │  App state:    chosen in the app Setup dialog"
+fi
 echo "  │  MLflow:       ${MLFLOW_EXPERIMENT_ID:-<disabled>}"
 echo "  │  Release check: $([ "$UPDATE_CHECK" = "true" ] && echo on || echo off)"
 echo "  └───────────────────────────────────────────────────────────┘"
@@ -930,10 +815,10 @@ echo -e "    ${GREEN}✓${NC} App OAuth scopes and resources configured"
 echo -e "    ${GREEN}✓${NC} GSO optimization job deployed"
 echo -e "    ${GREEN}✓${NC} UC grants on ${CATALOG}.${GSO_SCHEMA}"
 
-if [ -n "$LAKEBASE_INSTANCE" ]; then
-    echo -e "    ${GREEN}✓${NC} Lakebase configured: $LAKEBASE_INSTANCE"
+if [ -n "$STATE_CATALOG" ]; then
+    echo -e "    ${GREEN}✓${NC} App state: ${STATE_CATALOG}.${STATE_SCHEMA} (Delta)"
 else
-    echo -e "    ${YELLOW}⚠${NC} Lakebase skipped; history and sessions use in-memory storage"
+    echo -e "    ${YELLOW}○${NC} App state: open the app as an admin to finish the Setup dialog"
 fi
 
 if [ -n "$MLFLOW_EXPERIMENT_ID" ]; then
@@ -969,7 +854,12 @@ SP_NAME_FOR_DISPLAY="${SP_DISPLAY_NAME:-${SP_CLIENT_ID:-<app-service-principal>}
 echo ""
 echo -e "  ${BOLD}Next:${NC}"
 echo "    1. Open the app URL above."
-echo "    2. Wait a minute if the app is still starting, then run a scan."
+if [ -z "$STATE_CATALOG" ]; then
+    echo "    2. As a workspace admin, choose the state location in the Setup dialog."
+    echo "    3. Run a scan."
+else
+    echo "    2. Wait a minute if the app is still starting, then run a scan."
+fi
 echo ""
 echo -e "  ${BOLD}Optional follow-up:${NC}"
 echo "    • Auto-Optimize data access: if a run reports missing table access,"
@@ -977,10 +867,8 @@ echo "      open Auto-Optimize → Settings to identify schemas, then grant:"
 echo -e "      ${CYAN}GRANT SELECT ON SCHEMA <catalog>.<schema> TO \`${SP_NAME_FOR_DISPLAY}\`${NC}"
 echo "    • Future Genie Agents: share new spaces with '${SP_NAME_FOR_DISPLAY}'"
 echo "      when you want SP fallback or Auto-Optimize support."
-if [ -z "$LAKEBASE_INSTANCE" ]; then
-    echo "    • Persistent history: set GENIE_LAKEBASE_INSTANCE in .env.deploy,"
-    echo "      then run ./scripts/deploy.sh --update."
-fi
+echo "    • Other workspaces: Admin > Workspaces registers more workspaces in this"
+echo "      account (add the app service principal there, or use a dedicated SP)."
 if [ -z "$MLFLOW_EXPERIMENT_ID" ]; then
     echo "    • Agent tracing: set GENIE_MLFLOW_EXPERIMENT_ID in .env.deploy,"
     echo "      then run ./scripts/deploy.sh --update."

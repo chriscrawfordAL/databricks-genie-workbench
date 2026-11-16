@@ -20,7 +20,7 @@ tests pin the offline seams without a warehouse or Databricks:
 - **Discovery pipeline** (``discover_candidates``): the honest-empty ``status``
   discriminator (no_candidates / fully_connected / no_metadata / no_warehouse /
   ok) and the FK upgrade, driven by stubbed ``_table_infos`` and ``execute_sql``.
-- **Persistence**: ``lakebase.save_join_advice`` / ``get_join_advice`` round-trip
+- **Persistence**: ``state_store.save_join_advice`` / ``get_join_advice`` round-trip
   and clear (in-memory fallback).
 - **Endpoints**: ``/join-candidates`` and ``/join-advice`` (GET/POST) shapes,
   aliases, and the empty-clears contract.
@@ -43,7 +43,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.routers import auto_optimize
-from backend.services import join_advisor, lakebase
+from backend.services import join_advisor, state_store
 
 # ── Heuristics ───────────────────────────────────────────────────────────────
 
@@ -465,16 +465,16 @@ async def test_join_advice_roundtrip_and_clear():
         "to": "c.s.customer", "toCol": "customer_id",
         "rel": "N:1", "match": "name-type", "probe": 0.97, "note": None,
     }]
-    saved = await lakebase.save_join_advice(space_id, seeds, seeded_by="tester@example.com")
+    saved = await state_store.save_join_advice(space_id, seeds, seeded_by="tester@example.com")
     assert saved["seeds"] == seeds
-    got = await lakebase.get_join_advice(space_id)
+    got = await state_store.get_join_advice(space_id)
     assert got is not None
     assert got["seeds"] == seeds
     assert got["seeded_by"] == "tester@example.com"
 
     # Empty seeds clears the advice.
-    await lakebase.save_join_advice(space_id, [], seeded_by="tester@example.com")
-    assert await lakebase.get_join_advice(space_id) is None
+    await state_store.save_join_advice(space_id, [], seeded_by="tester@example.com")
+    assert await state_store.get_join_advice(space_id) is None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────

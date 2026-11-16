@@ -7,7 +7,7 @@ import logging
 
 from fastapi import APIRouter, Query
 
-from backend.services import lakebase
+from backend.services import state_store
 from backend.watch._validators import validate_days, validate_space_id
 from backend.watch.models import (
     Conversation,
@@ -75,7 +75,7 @@ async def get_space_usage(
         positive=pos, negative=neg, total=len(fb_objs), sample=fb_objs[:50],
     )
 
-    convo_rows = await lakebase.watch_list_conversations(sid, limit=50)
+    convo_rows = await state_store.watch_list_conversations(sid, limit=50)
     convos = [Conversation(**c) for c in convo_rows]
 
     return UsageRollup(

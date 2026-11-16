@@ -10,12 +10,12 @@
 # MAGIC
 # MAGIC **Required workspace previews/settings:** Databricks Apps and **Databricks Apps On-Behalf-of-User authorization** (Public Preview) must be enabled. Workspace admins manage preview toggles from the Databricks **Previews** page.
 # MAGIC
-# MAGIC **Optional:** Lakebase Autoscaling is recommended for persistent app state. Set `lakebase_mode` to `skip` only when ephemeral in-memory state is acceptable.
+# MAGIC **App state:** the app keeps its state (scan history, stars, settings, Create Agent sessions, workspace connections) in a Unity Catalog Delta table. Set `state_catalog` and `state_schema` to choose the location now, or leave `state_catalog` blank and a workspace admin picks it in the app's **Setup** dialog the first time the app opens.
 # MAGIC
 # MAGIC **Upgrading?** Click **Pull** on this Git folder. If Pull reports a conflict in `notebooks/install.py`, discard your changes to `notebooks/install.py` and Pull again (Databricks edits this notebook when it runs, so discarding loses nothing). Then **Run all** with the widget values you installed with.
 
 # COMMAND ----------
-# MAGIC %pip install databricks-sdk==0.117.0 pyyaml==6.0.3 "psycopg[binary]==3.3.3" hatchling==1.29.0 uv-dynamic-versioning==0.13.0
+# MAGIC %pip install databricks-sdk==0.117.0 pyyaml==6.0.3 hatchling==1.29.0 uv-dynamic-versioning==0.13.0
 
 # COMMAND ----------
 dbutils.library.restartPython()
@@ -63,8 +63,9 @@ print(f"Repo root: {repo_root}")
 dbutils.widgets.text("app_name", "genie-workbench")
 dbutils.widgets.text("catalog", "")
 dbutils.widgets.text("warehouse_id", "")
-dbutils.widgets.dropdown("lakebase_mode", "create", ["create", "existing", "skip"])
-dbutils.widgets.text("lakebase_project_name", "")
+# App state location (Delta). Blank state_catalog = choose it in the app's Setup dialog.
+dbutils.widgets.text("state_catalog", "")
+dbutils.widgets.text("state_schema", "genie_workbench_state")
 dbutils.widgets.dropdown("llm_route", "gateway", ["gateway", "classic"])
 # release_check (daily GitHub release check): auto = on for a new app; for an existing
 # app keep the previous answer, or ask users on the Admin tab if there is none.
@@ -82,7 +83,7 @@ dbutils.widgets.dropdown("release_check", "auto", ["auto", "yes", "no"])
 # MAGIC - [ ] **Databricks Apps On-Behalf-of-User authorization** Public Preview is enabled.
 # MAGIC - [ ] The selected SQL warehouse exists and you have `CAN_USE`.
 # MAGIC - [ ] The selected Unity Catalog exists and you can create/use the target schema.
-# MAGIC - [ ] If `lakebase_mode` is not `skip`, Lakebase Autoscaling is available.
+# MAGIC - [ ] If you set `state_catalog`, you can use that catalog. The installer creates `state_schema` if it is missing and grants the app access to it. Leave `state_catalog` blank to choose the location later in the app's Setup dialog.
 # MAGIC - [ ] If `llm_route` is `gateway` (the default), the workspace is in a Unity AI Gateway region.
 # MAGIC   The installer checks this with one small request and stops early if it fails; choose
 # MAGIC   `classic` to use serving endpoints instead.
@@ -99,7 +100,6 @@ import scripts.deploy_lib.config
 import scripts.deploy_lib.genie_spaces
 import scripts.deploy_lib.gso_job
 import scripts.deploy_lib.install
-import scripts.deploy_lib.lakebase
 import scripts.deploy_lib.uc
 import scripts.deploy_lib.verify
 import scripts.deploy_lib.workspace_source
@@ -110,7 +110,6 @@ for module in [
     scripts.deploy_lib.apps,
     scripts.deploy_lib.config,
     scripts.deploy_lib.genie_spaces,
-    scripts.deploy_lib.lakebase,
     scripts.deploy_lib.uc,
     scripts.deploy_lib.verify,
     scripts.deploy_lib.gso_job,
@@ -128,19 +127,8 @@ def notebook_status(message: str) -> None:
 
 
 app_name = dbutils.widgets.get("app_name").strip()
-lakebase_mode = dbutils.widgets.get("lakebase_mode").strip()
-explicit_lakebase = dbutils.widgets.get("lakebase_project_name").strip()
-
-if lakebase_mode == "skip":
-    lakebase_instance = None
-elif explicit_lakebase:
-    lakebase_instance = explicit_lakebase
-elif lakebase_mode == "existing":
-    lakebase_instance = f"{app_name}-lakebase"
-else:
-    # create + blank: the installer reuses the existing app's project, or uses
-    # <app_name>-lakebase for a new app.
-    lakebase_instance = None
+state_catalog = dbutils.widgets.get("state_catalog").strip()
+state_schema = dbutils.widgets.get("state_schema").strip()
 
 cfg = InstallConfig(
     app_name=app_name,
@@ -149,8 +137,8 @@ cfg = InstallConfig(
     llm_route=dbutils.widgets.get("llm_route").strip(),
     release_check=dbutils.widgets.get("release_check").strip(),
     mlflow_experiment_id=None,
-    lakebase_mode=lakebase_mode,
-    lakebase_instance=lakebase_instance,
+    state_catalog=state_catalog or None,
+    state_schema=state_schema or None,
     repo_root=str(repo_root),
     grant_genie_spaces=True,
 )
@@ -159,4 +147,11 @@ w = WorkspaceClient()
 notebook_status("Starting Genie Workbench notebook install")
 result = run_install(w, cfg, status_fn=notebook_status)
 notebook_status("Notebook install finished")
+if result.get("state_location"):
+    notebook_status(f"App state: {result['state_location']}.workbench_state (Delta)")
+else:
+    notebook_status(
+        "App state location not set. Open the app as a workspace admin and complete the "
+        "Setup dialog to choose the catalog and schema for its Delta state table."
+    )
 result

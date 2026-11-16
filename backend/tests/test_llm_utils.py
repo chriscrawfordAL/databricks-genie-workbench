@@ -66,7 +66,7 @@ def test_call_serving_endpoint_normalizes_structured_content(monkeypatch):
             }]
         },
     )
-    monkeypatch.setattr(llm_utils, "get_workspace_client", lambda: client)
+    monkeypatch.setattr(llm_utils, "get_home_workspace_client", lambda: client)
     monkeypatch.setattr(llm_utils.httpx, "post", lambda *args, **kwargs: response)
 
     result = llm_utils.call_serving_endpoint(
@@ -95,7 +95,7 @@ def _capture_post(monkeypatch, status=200):
         captured.append(SimpleNamespace(url=url, json=json, headers=headers))
         return response
 
-    monkeypatch.setattr(llm_utils, "get_workspace_client", lambda: client)
+    monkeypatch.setattr(llm_utils, "get_home_workspace_client", lambda: client)
     monkeypatch.setattr(llm_utils.httpx, "post", fake_post)
     return captured
 
@@ -176,8 +176,8 @@ def _scope_rig(monkeypatch, first_status=403, first_text=_SCOPE_403, sp_is_user=
         return SimpleNamespace(status_code=200, text="", headers={},
                                json=lambda: {"choices": [{"message": {"content": "ok"}}]})
 
-    monkeypatch.setattr(llm_utils, "get_workspace_client", lambda: user)
-    monkeypatch.setattr(llm_utils, "get_service_principal_client", lambda: user if sp_is_user else sp)
+    monkeypatch.setattr(llm_utils, "get_home_workspace_client", lambda: user)
+    monkeypatch.setattr(llm_utils, "get_home_service_principal_client", lambda: user if sp_is_user else sp)
     monkeypatch.setattr(llm_utils.httpx, "post", fake_post)
     return posts
 

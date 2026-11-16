@@ -1,6 +1,5 @@
 import asyncio
 import json
-import time
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -23,6 +22,10 @@ def test_agent_chat_request_model_is_saved_on_session(monkeypatch):
     monkeypatch.setattr("backend.services.create_agent.get_create_agent", lambda: FakeAgent())
     monkeypatch.setattr("backend.services.model_catalog.validate_chat_model", lambda model, client=None: model)
     monkeypatch.setattr("backend.services.auth.get_workspace_client", lambda: object())
+    # Model validation runs against the home workspace (serving lives there).
+    monkeypatch.setattr(
+        "backend.services.auth.get_home_workspace_client", lambda: object(), raising=False,
+    )
     monkeypatch.setattr(create, "persist_session", lambda session: None, raising=False)
 
     app = FastAPI()
@@ -102,59 +105,32 @@ def test_agent_chat_continuation_is_not_gated(monkeypatch):
 
 
 def test_agent_session_persistence_round_trips_llm_model(monkeypatch):
-    class FakeConn:
-        def __init__(self):
-            self.execute_calls = []
+    """A session (incl. its llm_model) survives a flush to Delta and a cold read."""
+    from backend.services import delta_store, state_store
 
-        async def execute(self, sql, *args):
-            self.execute_calls.append((sql, args))
-
-        async def fetchrow(self, sql, session_id):
-            now = time.time()
-            return {
-                "session_id": session_id,
-                "history": json.dumps([]),
-                "space_config": None,
-                "space_id": None,
-                "space_url": None,
-                "selected_catalogs": json.dumps([]),
-                "selected_schemas": json.dumps([]),
-                "selected_tables": json.dumps([]),
-                "feasibility_confirmed": False,
-                "llm_model": "persisted-chat",
-                "created_at": now,
-                "last_active": now,
-            }
-
-    class Acquire:
-        def __init__(self, conn):
-            self.conn = conn
-
-        async def __aenter__(self):
-            return self.conn
-
-        async def __aexit__(self, *args):
-            return False
-
-    class FakePool:
-        def __init__(self, conn):
-            self.conn = conn
-
-        def acquire(self):
-            return Acquire(self.conn)
-
-    conn = FakeConn()
-    monkeypatch.setattr(create_agent_session, "_get_pool", lambda: FakePool(conn))
+    table: dict[tuple[str, str], str] = {}
+    monkeypatch.setattr(state_store, "_lazy_pending", {})
+    monkeypatch.setattr(state_store, "_dirty", {})
+    monkeypatch.setattr(state_store, "_ready", True)
+    monkeypatch.setattr(delta_store, "available", lambda: True)
+    monkeypatch.setattr(
+        delta_store, "upsert",
+        lambda store, items: table.update({(store, k): v for k, v in items}),
+    )
+    monkeypatch.setattr(delta_store, "delete", lambda store, keys: None)
+    monkeypatch.setattr(delta_store, "get_value", lambda store, key: table.get((store, key)))
 
     async def run():
         await create_agent_session._ensure_table()
         session = AgentSession(session_id="s1", llm_model="persisted-chat")
         await create_agent_session._persist(session)
+        await state_store.flush()
+        assert state_store._lazy_pending.get("agent_sessions") == {}
         return await create_agent_session._load("s1")
 
     loaded = asyncio.run(run())
 
-    assert any("llm_model" in sql for sql, _ in conn.execute_calls)
-    assert any(args and "persisted-chat" in args for _, args in conn.execute_calls)
+    stored = json.loads(table[("agent_sessions", "s1")])
+    assert stored["llm_model"] == "persisted-chat"
     assert loaded is not None
     assert loaded.llm_model == "persisted-chat"

@@ -15,9 +15,9 @@ The routes run in-process via FastAPI `TestClient`. Identity is injected exactly
 as Databricks Apps does it: the real `OBOAuthMiddleware` reads
 `x-forwarded-access-token` and calls `set_obo_user_token` inside the request
 context, so both the router and the services layer see the OBO client. The
-`no-local-server` rule exists because OBO / Lakebase / serving aren't available
+`no-local-server` rule exists because OBO / serving aren't available
 locally — here OBO is a real token, the MV routes read through **Statement
-Execution** (not Lakebase), and nothing serves HTTP. So the rule is satisfied for
+Execution**, and nothing serves HTTP. So the rule is satisfied for
 the reason it exists. (A deployed-app PAT can't reliably populate
 `x-forwarded-access-token`, which is why option B was rejected.)
 

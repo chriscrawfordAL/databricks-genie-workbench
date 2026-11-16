@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Any, Callable, Literal, TypeVar
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -62,8 +62,7 @@ from backend.services.auth import (
     get_workspace_client,
     require_obo_workspace_client,
 )
-from backend.services import gso_lakebase
-from backend.services import lakebase as workbench_lakebase
+from backend.services import state_store as workbench_state
 from backend.services.config_fingerprint import benchmark_fingerprint, config_fingerprint
 from backend.services.genie_client import get_genie_space, get_serialized_space
 from backend.services.model_catalog import ModelValidationError, validate_chat_model
@@ -100,7 +99,96 @@ from genie_space_optimizer.optimization.mv_tables import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/auto-optimize")
+# ── Cross-workspace (remote agent) binding ─────────────────────────────────
+# Auto-Optimize's data plane — GSO Delta run state, the optimizer job, MLflow,
+# LLM calls — always stays in the home workspace, so the app's full target
+# switch is not applied to this router (see main._HOME_ONLY_PREFIXES). When a
+# remote workspace is selected, this dependency binds only the *agent* client:
+# space-access checks and user-scoped agent reads go to the remote workspace
+# (as its service principal), and mutating endpoints pass ``agent_ws`` plus a
+# secret-free ``target`` descriptor to the GSO engine, which runs benchmark SQL,
+# profiling and Genie updates remotely while keeping its state at home.
+
+# Routes that are bound to home Unity Catalog / home warehouse semantics and are
+# not offered for agents in other workspaces (the UI hides the Model tab there).
+_REMOTE_UNSUPPORTED_MARKERS = ("/mv", "/mv-", "/semantic-graph", "/join-")
+
+
+async def _bind_remote_agent(request: Request):
+    from backend.services.auth import is_admin_request, reset_agent_client, set_agent_client
+
+    conn_id = request.headers.get("x-target-workspace", "").strip()
+    request.state.agent_ws = None
+    request.state.agent_conn = None
+    request.state.agent_target = None
+    if not conn_id:
+        yield
+        return
+    if not is_admin_request(request):
+        raise HTTPException(status_code=403, detail="Only workspace admins can optimize agents in other workspaces.")
+    path = request.url.path
+    if any(m in path for m in _REMOTE_UNSUPPORTED_MARKERS):
+        raise HTTPException(
+            status_code=400,
+            detail="Metric view and join advisors are available only for agents in this app's home workspace.",
+        )
+    from backend.services import workspaces as ws_service
+
+    conn = await ws_service.get_connection(conn_id)
+    if not conn:
+        raise HTTPException(status_code=404, detail="The selected workspace is no longer registered.")
+    try:
+        agent_ws = await ws_service.get_client_for_workspace(conn_id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Could not connect to the selected workspace: {str(e)[:200]}")
+    request.state.agent_ws = agent_ws
+    request.state.agent_conn = conn
+    request.state.target_workspace_id = conn_id
+    token = set_agent_client(agent_ws)
+    try:
+        yield
+    finally:
+        reset_agent_client(token)
+
+
+def _remote_job_target(request: Request) -> dict | None:
+    """Secret-free descriptor the GSO job uses to rebuild the remote agent client.
+
+    Remote optimization needs a dedicated-service-principal connection: the job
+    runs at home as the app's service principal, which has no secret of its own
+    to sign in to another workspace, so it reads the dedicated SP's secret from
+    the home secret scope by reference.
+    """
+    conn = getattr(request.state, "agent_conn", None)
+    if not conn:
+        return None
+    if conn.get("auth_mode", "custom_sp") != "custom_sp" or not conn.get("secret_key"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Optimizing agents in another workspace needs a connection that uses a dedicated "
+                "service principal (Admin → Workspaces). Connections that use this app's own "
+                "service principal support listing, scanning, creating and monitoring only."
+            ),
+        )
+    return {
+        "workspace_id": conn["workspace_id"],
+        "host": conn["host"],
+        "client_id": conn["client_id"],
+        "secret_scope": conn["secret_scope"],
+        "secret_key": conn["secret_key"],
+        "warehouse_id": conn.get("warehouse_id"),
+        "remote_workspace_id": conn.get("remote_workspace_id"),
+    }
+
+
+def _agent_kwargs(request: Request | None) -> dict:
+    """``agent_ws`` for GSO integration calls when the agent is in another workspace."""
+    agent_ws = getattr(getattr(request, "state", None), "agent_ws", None) if request is not None else None
+    return {"agent_ws": agent_ws} if agent_ws is not None else {}
+
+
+router = APIRouter(prefix="/api/auto-optimize", dependencies=[Depends(_bind_remote_agent)])
 
 
 def _genie_benchmark_url(
@@ -204,7 +292,7 @@ def _typed_terminal_reason(run: dict | None) -> str | None:
 
 
 def _safe_bool(value: Any) -> bool:
-    """Coerce Delta/Lakebase bool-ish values without treating "false" as true."""
+    """Coerce Delta bool-ish values without treating "false" as true."""
     if isinstance(value, bool):
         return value
     if value is None:
@@ -1411,18 +1499,36 @@ async def health():
 
 
 @router.get("/permissions/{space_id}")
-async def check_permissions(space_id: SpaceId):
-    """Pre-check SP and UC permissions for a Genie Agent before optimization."""
+async def check_permissions(space_id: SpaceId, request: Request):
+    """Pre-check SP and UC permissions for a Genie Agent before optimization.
+
+    For an agent in another workspace every check is about that workspace: the
+    connection's service principal needs CAN_MANAGE on the agent and read access
+    to its tables (it runs the benchmark SQL there, on that workspace's
+    warehouse), and system.query.history is probed in that workspace.
+    """
     await require_space_access(space_id, SpaceAccessLevel.EDIT)
     if not _is_configured():
         raise HTTPException(status_code=503, detail="Auto-Optimize is not configured.")
 
-    sp_ws = get_service_principal_client()
+    agent_ws = getattr(request.state, "agent_ws", None)
+    agent_conn = getattr(request.state, "agent_conn", None) or {}
+    is_remote = agent_ws is not None
+    sp_ws = agent_ws or get_service_principal_client()
+    user_ws = agent_ws or get_workspace_client()
     errors: list[str] = []
+    if is_remote and agent_conn.get("auth_mode") != "custom_sp":
+        errors.append(
+            "This workspace connection uses the app's own service principal. Optimizing agents in "
+            "another workspace needs a connection with a dedicated service principal."
+        )
 
     # Resolve SP identity — config.client_id is the UUID that UC SQL accepts
     sp_display_name = ""
-    sp_application_id = sp_ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "")
+    sp_application_id = (
+        (agent_conn.get("client_id") or "") if is_remote
+        else (sp_ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", ""))
+    )
     try:
         me = sp_ws.current_user.me()
         sp_display_name = me.display_name or me.user_name or ""
@@ -1449,7 +1555,9 @@ async def check_permissions(space_id: SpaceId):
         sp_aliases = get_sp_principal_aliases(sp_ws)
         # Try ACL fetch with user's OBO client (has access-management scope);
         # fall back to serialized-space fetch via SP if ACL read fails.
-        obo_ws = get_workspace_client()
+        if is_remote and sp_application_id and sp_application_id not in sp_aliases:
+            sp_aliases = [*sp_aliases, sp_application_id]
+        obo_ws = user_ws
         sp_has_manage = sp_can_manage_space(obo_ws, space_id, sp_aliases, sp_client=sp_ws)
     except Exception as exc:
         errors.append(f"Could not check Genie Agent access: {exc}")
@@ -1491,7 +1599,7 @@ async def check_permissions(space_id: SpaceId):
         logger.warning("Could not probe data access for space %s", space_id, exc_info=True)
 
     all_read = all(s.read_granted for s in schemas) if schemas else True
-    can_start = sp_has_manage and all_read
+    can_start = sp_has_manage and all_read and not (is_remote and agent_conn.get("auth_mode") != "custom_sp")
 
     system_history_available = False
     try:
@@ -1499,9 +1607,17 @@ async def check_permissions(space_id: SpaceId):
         from genie_space_optimizer.common.query_tags import gso_query_tags
 
         gso_config = _build_gso_config()
-        if gso_config.warehouse_id:
+        probe_warehouse = gso_config.warehouse_id
+        if is_remote:
+            from backend.services.workspaces import resolve_remote_warehouse
+
+            probe_warehouse = await asyncio.to_thread(resolve_remote_warehouse, agent_conn, agent_ws)
+            if not probe_warehouse:
+                errors.append("No SQL warehouse is available to the service principal in that workspace.")
+                can_start = False
+        if probe_warehouse:
             probe = sp_ws.statement_execution.execute_statement(
-                warehouse_id=gso_config.warehouse_id,
+                warehouse_id=probe_warehouse,
                 statement="SELECT 1 FROM system.query.history LIMIT 1",
                 wait_timeout="10s",
                 disposition=Disposition.INLINE,
@@ -1521,7 +1637,7 @@ async def check_permissions(space_id: SpaceId):
             for warehouse in sp_ws.warehouses.list()
             if str(getattr(warehouse, "id", "") or "").strip()
         }
-        for warehouse in get_workspace_client().warehouses.list():
+        for warehouse in user_ws.warehouses.list():
             warehouse_id = str(getattr(warehouse, "id", "") or "").strip()
             if not warehouse_id:
                 continue
@@ -1737,6 +1853,11 @@ async def trigger(body: TriggerRequest, request: Request):
 
     ws = get_workspace_client()
     sp_ws = get_service_principal_client()
+    # Remote agent (another workspace): Genie/agent-data work runs there as the
+    # connection's service principal; run state, the job and LLM calls stay home.
+    agent_ws = getattr(request.state, "agent_ws", None)
+    remote_target = _remote_job_target(request)
+    is_remote = remote_target is not None
     selected_llm_model = (body.llm_model or "").strip() or None
     if selected_llm_model:
         try:
@@ -1752,7 +1873,8 @@ async def trigger(body: TriggerRequest, request: Request):
     # ContextVar is visible) after the run row exists and before submit (MV-D20).
     mv_attach_hook = None
     if (
-        body.enable_metric_view_suggestions
+        not is_remote
+        and body.enable_metric_view_suggestions
         and body.mv_action_mode == "create_and_attach"
         and body.mv_consent is not None
     ):
@@ -1777,7 +1899,7 @@ async def trigger(body: TriggerRequest, request: Request):
     # read failure, simply means the run starts with none.
     proposed_join_seeds: list[dict] = []
     try:
-        advice = await workbench_lakebase.get_join_advice(body.space_id)
+        advice = None if is_remote else await workbench_state.get_join_advice(body.space_id)
         if advice and advice.get("seeds"):
             proposed_join_seeds = list(advice["seeds"])
     except Exception:
@@ -1787,7 +1909,8 @@ async def trigger(body: TriggerRequest, request: Request):
     # and flag-gated; a no-op unless the VC observe surface is integrated and writes are
     # enabled). This never alters or blocks the optimizer run — capture_before swallows
     # its own failures.
-    observe = getattr(request.app.state, "vc_observe", None)
+    # (VC is bound to the home workspace: remote agents are not captured.)
+    observe = None if is_remote else getattr(request.app.state, "vc_observe", None)
     if observe is not None:
         from backend.services.version_control.observe_optimizer import capture_before
 
@@ -1808,12 +1931,20 @@ async def trigger(body: TriggerRequest, request: Request):
             max_attempts=body.max_attempts,
             workload_warehouse_ids=body.workload_warehouse_ids,
             benchmark_policy=body.benchmark_policy,
-            enable_metric_view_suggestions=body.enable_metric_view_suggestions,
+            enable_metric_view_suggestions=False if is_remote else body.enable_metric_view_suggestions,
             mv_action_mode=body.mv_action_mode,
             mv_min_confidence=body.mv_min_confidence,
             mv_attach_hook=mv_attach_hook,
             proposed_join_seeds=proposed_join_seeds,
             operator_guidance=(body.operator_guidance or "").strip() or None,
+            **(
+                {
+                    "agent_ws": agent_ws,
+                    "target": remote_target,
+                    "agent_sp_aliases": [remote_target["client_id"]],
+                }
+                if is_remote else {}
+            ),
         )
         # Echo the resolved knobs (request value or the job default) so the UI
         # can confirm what the run will use without re-reading the job config.
@@ -3834,7 +3965,7 @@ async def get_join_candidates(space_id: SpaceId):
 async def get_join_advice(space_id: SpaceId):
     """Read the pending Join Advisor advice seeded for a space (§7)."""
     await require_space_access(space_id, SpaceAccessLevel.EDIT)
-    record = await workbench_lakebase.get_join_advice(space_id)
+    record = await workbench_state.get_join_advice(space_id)
     if not record:
         return JoinAdviceResponse(space_id=space_id, seeds=[])
     return JoinAdviceResponse(
@@ -3859,7 +3990,7 @@ async def save_join_advice(space_id: SpaceId, body: JoinAdvicePayload, request: 
         "x-forwarded-preferred-username"
     )
     seeds = [s.model_dump(by_alias=True) for s in body.seeds]
-    record = await workbench_lakebase.save_join_advice(space_id, seeds, seeded_by=seeded_by)
+    record = await workbench_state.save_join_advice(space_id, seeds, seeded_by=seeded_by)
     return JoinAdviceResponse(
         space_id=space_id,
         seeds=[JoinCandidate.model_validate(s) for s in record.get("seeds", [])],
@@ -4770,8 +4901,8 @@ def _map_stages_to_steps(
 async def get_run(run_id: RunId):
     """Get full run detail including stages, iterations, levers, and patches."""
     await _require_run_space_access(run_id, SpaceAccessLevel.EDIT)
-    run = await gso_lakebase.load_gso_run(run_id)
-    if not run and _is_configured():
+    run = None
+    if _is_configured():
         rows = await _delta_query_async(
             f"SELECT * FROM {_delta_table('genie_opt_runs')} WHERE run_id = '{run_id}'"
         )
@@ -4779,16 +4910,16 @@ async def get_run(run_id: RunId):
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    stages = await gso_lakebase.load_gso_stages(run_id)
-    if not stages and _is_configured():
+    stages = []
+    if _is_configured():
         stages = await _delta_query_async(
             f"SELECT * FROM {_delta_table('genie_opt_stages')} "
             f"WHERE run_id = '{run_id}' ORDER BY started_at ASC"
         )
 
     # Fetch iterations (lightweight — no rows_json)
-    iterations = await gso_lakebase.load_gso_iterations(run_id)
-    if not iterations and _is_configured():
+    iterations = []
+    if _is_configured():
         iterations = await _offload(_select_iterations_delta, run_id)
 
     # GSO v2 Phase 6 — attach the baseline iteration's rows_json so the
@@ -4804,8 +4935,8 @@ async def get_run(run_id: RunId):
         None,
     )
     if baseline_row is not None:
-        rows_json_str = await gso_lakebase.load_gso_iteration_rows(run_id, 0, "full")
-        if not rows_json_str and _is_configured():
+        rows_json_str = None
+        if _is_configured():
             _dr = await _delta_query_async(
                 f"SELECT rows_json FROM {_delta_table('genie_opt_iterations')} "
                 f"WHERE run_id = '{run_id}' AND iteration = 0 AND eval_scope = 'full' "
@@ -4816,8 +4947,8 @@ async def get_run(run_id: RunId):
             baseline_row["rows_json"] = rows_json_str
 
     # Fetch patches for lever detail
-    patches = await gso_lakebase.load_gso_patches(run_id)
-    if not patches and _is_configured():
+    patches = []
+    if _is_configured():
         patches = await _delta_query_async(
             f"SELECT * FROM {_delta_table('genie_opt_patches')} "
             f"WHERE run_id = '{run_id}' ORDER BY iteration, lever, patch_index"
@@ -4949,8 +5080,8 @@ async def get_run(run_id: RunId):
 async def get_run_status(run_id: RunId):
     """Lightweight status poll endpoint."""
     await _require_run_space_access(run_id, SpaceAccessLevel.VIEW)
-    run = await gso_lakebase.load_gso_run(run_id)
-    if not run and _is_configured():
+    run = None
+    if _is_configured():
         rows = await _delta_query_async(
             f"SELECT * FROM {_delta_table('genie_opt_runs')} WHERE run_id = '{run_id}'"
         )
@@ -4974,8 +5105,8 @@ async def get_run_status(run_id: RunId):
     if job_progress is not None:
         steps_completed, current_step_name = job_progress
     else:
-        stages = await gso_lakebase.load_gso_stages(run_id)
-        if not stages and _is_configured():
+        stages = []
+        if _is_configured():
             stages = await _delta_query_async(
                 f"SELECT * FROM {_delta_table('genie_opt_stages')} "
                 f"WHERE run_id = '{run_id}' ORDER BY started_at ASC"
@@ -4991,8 +5122,8 @@ async def get_run_status(run_id: RunId):
             current_step_name = _STEP_DEFINITIONS[steps_completed]["name"]
 
     # Compute baseline vs optimized scores from iterations (lightweight query)
-    iterations = await gso_lakebase.load_gso_iterations(run_id)
-    if not iterations and _is_configured():
+    iterations = []
+    if _is_configured():
         iterations = await _offload(_select_iterations_delta, run_id) or []
 
     # Canonical baseline + optimized + best_iteration. See
@@ -5004,13 +5135,12 @@ async def get_run_status(run_id: RunId):
     # and rolled-back iterations were not filtered. The canonical helper
     # closes both: full-scope only, exclude rolled-back, floor-at-baseline.
     #
-    # A kept attach's score lives on its stage row (MV-D118). Lakebase stage reads
-    # are off, so when the Jobs API answered, the poll reads that one stage from
-    # Delta, and only once there is a baseline to score it against (MV-D121).
+    # A kept attach's score lives on its stage row (MV-D118). When the Jobs API
+    # answered, the poll reads that one stage from Delta, and only once there is a baseline to score it against (MV-D121).
     score_stages = stages
     if score_stages is None:
-        score_stages = await gso_lakebase.load_gso_stages(run_id)
-        if not score_stages and iterations and _is_configured():
+        score_stages = []
+        if iterations and _is_configured():
             score_stages = await _delta_query_async(
                 f"SELECT stage, detail_json FROM {_delta_table('genie_opt_stages')} "
                 f"WHERE run_id = '{run_id}' AND stage = '{_MV_ATTACH_STAGE}' "
@@ -5058,14 +5188,14 @@ async def list_levers():
 
 
 @router.post("/runs/{run_id}/apply")
-async def apply_run(run_id: RunId):
+async def apply_run(run_id: RunId, request: Request):
     """Apply an optimization run's results to the Genie Agent."""
     await _require_run_space_access(run_id, SpaceAccessLevel.EDIT)
     ws = get_workspace_client()
     config = _build_gso_config()
 
     try:
-        result = await _offload(apply_optimization, run_id, ws, config)
+        result = await _offload(apply_optimization, run_id, ws, config, **_agent_kwargs(request))
         await _offload(_invalidate_live_fingerprint_for_run, run_id)
         return {"status": result.status, "runId": result.run_id, "message": result.message}
     except ValueError as e:
@@ -5078,7 +5208,7 @@ async def apply_run(run_id: RunId):
 
 
 @router.post("/runs/{run_id}/discard")
-async def discard_run(run_id: RunId):
+async def discard_run(run_id: RunId, request: Request):
     """Discard an optimization run and rollback to pre-optimization state."""
     await _require_run_space_access(run_id, SpaceAccessLevel.EDIT)
     ws = get_workspace_client()
@@ -5086,7 +5216,7 @@ async def discard_run(run_id: RunId):
     config = _build_gso_config()
 
     try:
-        result = await _offload(discard_optimization, run_id, ws, sp_ws, config)
+        result = await _offload(discard_optimization, run_id, ws, sp_ws, config, **_agent_kwargs(request))
         await _offload(_invalidate_live_fingerprint_for_run, run_id)
         return {"status": result.status, "runId": result.run_id, "message": result.message}
     except PermissionError as e:
@@ -5117,6 +5247,7 @@ async def revert_run(
     ),
     # Deprecated alias retained for existing callers and bookmarked URLs.
     target: str | None = Query(None, include_in_schema=False),
+    request: Request = None,  # type: ignore[assignment]
 ):
     """Revert a past run with independently selected config/benchmark scopes.
 
@@ -5154,6 +5285,7 @@ async def revert_run(
             config,
             target=resolved_config_target,
             benchmark_target=benchmark_target,
+            **_agent_kwargs(request),
         )
         await _offload(_invalidate_live_fingerprint_for_run, run_id)
         return {"status": result.status, "runId": result.run_id, "message": result.message}
@@ -5169,7 +5301,7 @@ async def revert_run(
 
 
 @router.get("/runs/{run_id}/revert-options")
-async def get_revert_options(run_id: RunId):
+async def get_revert_options(run_id: RunId, request: Request):
     """Preview available revert targets and benchmark snapshot diffs."""
     await _require_run_space_access(run_id, SpaceAccessLevel.EDIT)
     ws = get_workspace_client()
@@ -5182,6 +5314,7 @@ async def get_revert_options(run_id: RunId):
             ws,
             sp_ws,
             config,
+            **_agent_kwargs(request),
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
@@ -5463,7 +5596,7 @@ async def get_current_version(
         champion_rows = champions_result
 
     try:
-        hidden_run_ids = await workbench_lakebase.get_hidden_optimization_run_ids(
+        hidden_run_ids = await workbench_state.get_hidden_optimization_run_ids(
             space_id
         )
     except Exception:
@@ -5749,49 +5882,47 @@ def _enrich_run_summaries(runs: list[dict]) -> list[dict]:
 
 
 async def load_runs_with_fallback(space_id: str) -> list[dict]:
-    """Load optimization runs — Lakebase primary, Delta table fallback.
+    """Load optimization runs from the GSO Delta tables.
 
     Shared by the runs endpoint and the history endpoint.
     """
-    runs = await gso_lakebase.load_gso_runs_for_space(space_id)
-    if not runs:
-        if not _is_configured():
-            return []
+    if not _is_configured():
+        return []
 
-        base_cols = (
-            "run_id, space_id, status, started_at, completed_at, best_accuracy, "
-            "best_iteration, convergence_reason, triggered_by, llm_model"
+    base_cols = (
+        "run_id, space_id, status, started_at, completed_at, best_accuracy, "
+        "best_iteration, convergence_reason, triggered_by, llm_model"
+    )
+    suffix = (
+        "(config_snapshot IS NOT NULL AND length(config_snapshot) > 2) "
+        "AS has_config_snapshot"
+    )
+    table = _delta_table("genie_opt_runs")
+    # MV-D23 guardrail (ii): exclude sentinel advice runs from history through
+    # the single pinned predicate. The COALESCE tolerates legacy NULL
+    # run_kind; on a table that predates the column the strict query raises
+    # and the fallback below drops the predicate — correct, because a table
+    # without run_kind definitionally holds no advice runs.
+    from genie_space_optimizer.common.config import MV_ADVICE_RUN_EXCLUSION
+
+    try:
+        runs = _delta_query(
+            f"SELECT {base_cols}, benchmark_policy, benchmark_mutation_count, "
+            f"{suffix} FROM {table} WHERE space_id = '{space_id}' "
+            f"AND {MV_ADVICE_RUN_EXCLUSION} "
+            "ORDER BY started_at DESC",
+            strict=True,
         )
-        suffix = (
-            "(config_snapshot IS NOT NULL AND length(config_snapshot) > 2) "
-            "AS has_config_snapshot"
+    except Exception:
+        # History remains readable before the next run executes the additive
+        # migration. Legacy rows surface their benchmark handling as unknown,
+        # and a table without run_kind holds no advice runs to exclude.
+        runs = _delta_query(
+            f"SELECT {base_cols}, {suffix} FROM {table} "
+            f"WHERE space_id = '{space_id}' ORDER BY started_at DESC"
         )
-        table = _delta_table("genie_opt_runs")
-        # MV-D23 guardrail (ii): exclude sentinel advice runs from history through
-        # the single pinned predicate. The COALESCE tolerates legacy NULL
-        # run_kind; on a table that predates the column the strict query raises
-        # and the fallback below drops the predicate — correct, because a table
-        # without run_kind definitionally holds no advice runs.
-        from genie_space_optimizer.common.config import MV_ADVICE_RUN_EXCLUSION
 
-        try:
-            runs = _delta_query(
-                f"SELECT {base_cols}, benchmark_policy, benchmark_mutation_count, "
-                f"{suffix} FROM {table} WHERE space_id = '{space_id}' "
-                f"AND {MV_ADVICE_RUN_EXCLUSION} "
-                "ORDER BY started_at DESC",
-                strict=True,
-            )
-        except Exception:
-            # History remains readable before the next run executes the additive
-            # migration. Legacy rows surface their benchmark handling as unknown,
-            # and a table without run_kind holds no advice runs to exclude.
-            runs = _delta_query(
-                f"SELECT {base_cols}, {suffix} FROM {table} "
-                f"WHERE space_id = '{space_id}' ORDER BY started_at DESC"
-            )
-
-    hidden_run_ids = await workbench_lakebase.get_hidden_optimization_run_ids(space_id)
+    hidden_run_ids = await workbench_state.get_hidden_optimization_run_ids(space_id)
     visible_runs = [
         run for run in runs
         if str(run.get("run_id") or "") not in hidden_run_ids
@@ -5801,9 +5932,8 @@ async def load_runs_with_fallback(space_id: str) -> list[dict]:
 
 async def _load_run_envelope(run_id: str) -> dict | None:
     """Load the authoritative run envelope (run_id, space_id, status)."""
-    run = await gso_lakebase.load_gso_run(run_id)
-    if run or not _is_configured():
-        return run
+    if not _is_configured():
+        return None
     from genie_space_optimizer.common.warehouse import _wh_literal
 
     rows = await _delta_query_async(
@@ -5867,7 +5997,7 @@ async def remove_run_from_history(run_id: RunId, request: Request):
 
     hidden_by = user_email or os.environ.get("DEV_USER_EMAIL") or "unknown"
     try:
-        await workbench_lakebase.hide_optimization_run_from_history(
+        await workbench_state.hide_optimization_run_from_history(
             run_id,
             space_id,
             hidden_by,
@@ -5891,8 +6021,8 @@ async def remove_run_from_history(run_id: RunId, request: Request):
 async def list_iterations(run_id: RunId):
     """Get per-iteration evaluation details for a run (excludes rows_json for performance)."""
     await _require_run_space_access(run_id, SpaceAccessLevel.EDIT)
-    iterations = await gso_lakebase.load_gso_iterations(run_id)
-    if not iterations and _is_configured():
+    iterations = []
+    if _is_configured():
         iterations = await _offload(_select_iterations_delta, run_id)
     # Coerce key numeric fields — Delta fallback may return strings.
     # Bug #2: evaluated_count / excluded_count must round-trip as ints so the
@@ -6333,18 +6463,6 @@ async def debug_data(run_id: RunId):
         "warehouse_id": config.warehouse_id[:8] + "..." if config.warehouse_id else None,
     }
 
-    # Test Lakebase
-    lb_patches = await gso_lakebase.load_gso_patches(run_id)
-    lb_iterations = await gso_lakebase.load_gso_iterations(run_id)
-    lb_stages = await gso_lakebase.load_gso_stages(run_id)
-    lb_run = await gso_lakebase.load_gso_run(run_id)
-    diag["lakebase"] = {
-        "run_found": bool(lb_run),
-        "stages_count": len(lb_stages),
-        "iterations_count": len(lb_iterations),
-        "patches_count": len(lb_patches),
-    }
-
     # Test Delta fallback
     delta_diag: dict = {"attempted": False}
     if _is_configured():
@@ -6424,16 +6542,12 @@ async def debug_data(run_id: RunId):
 async def _load_iteration_rows_json(run_id: str, iteration: int) -> str | None:
     """Load the rows_json blob for an iteration (full scope, any-scope fallback).
 
-    Synced Lakebase reads are disabled today, so this resolves through the
-    Delta SQL-warehouse fallback in practice. Shared by the question-results
+    Reads the GSO Delta tables through the SQL warehouse. Shared by the question-results
     and official-eval-results endpoints.
     """
-    rows_json_str = await gso_lakebase.load_gso_iteration_rows(run_id, iteration, "full")
-    if not rows_json_str:
-        rows_json_str = await gso_lakebase.load_gso_iteration_rows(run_id, iteration, None)
-
+    rows_json_str = None
     if not rows_json_str and _is_configured():
-        logger.info("Lakebase returned no rows_json for run=%s iter=%s, trying Delta", run_id, iteration)
+        
         delta_rows = _delta_query(
             f"SELECT rows_json FROM {_delta_table('genie_opt_iterations')} "
             f"WHERE run_id = '{run_id}' AND iteration = {iteration} AND eval_scope = 'full' "
@@ -6475,8 +6589,8 @@ async def list_question_results(run_id: RunId, iteration: int = Query(..., descr
 async def list_patches(run_id: RunId):
     """Get all optimization patches for a run."""
     await _require_run_space_access(run_id, SpaceAccessLevel.EDIT)
-    patches = await gso_lakebase.load_gso_patches(run_id)
-    if not patches and _is_configured():
+    patches = []
+    if _is_configured():
         patches = _delta_query(
             f"SELECT * FROM {_delta_table('genie_opt_patches')} "
             f"WHERE run_id = '{run_id}' ORDER BY iteration, lever, patch_index"
@@ -6501,8 +6615,8 @@ async def list_benchmark_changes(run_id: RunId):
     QC + provenance views share one fetch. ``qc`` is null for legacy runs.
     """
     await _require_run_space_access(run_id, SpaceAccessLevel.EDIT)
-    mutations = await gso_lakebase.load_gso_benchmark_mutations(run_id)
-    if not mutations and _is_configured():
+    mutations = []
+    if _is_configured():
         mutations = await _delta_query_async(
             f"SELECT run_id, question_id, op, before, after, reason, logged_at "
             f"FROM {_delta_table('genie_opt_benchmark_mutations')} "
@@ -6518,8 +6632,8 @@ async def list_benchmark_changes(run_id: RunId):
     # statement as many content fragments while GSO serialized it as one.
     snapshot_states: dict[str, dict[str, str]] = {}
     if any(str(m.get("op") or "").strip().lower() == "changed" for m in mutations):
-        run_row = await gso_lakebase.load_gso_run(run_id)
-        if run_row is None and _is_configured():
+        run_row = None
+        if _is_configured():
             try:
                 rows = await _delta_query_async(
                     f"SELECT config_snapshot FROM {_delta_table('genie_opt_runs')} "

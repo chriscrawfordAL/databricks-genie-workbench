@@ -6,6 +6,8 @@ import { useCallback, useEffect, useState, Component } from "react"
 import type { ReactNode, ErrorInfo } from "react"
 import { LayoutGrid, BarChart2, BookOpen } from "lucide-react"
 import { ThemeToggle } from "@/components/ThemeToggle"
+import { WorkspaceSwitcher } from "@/components/WorkspaceSwitcher"
+import { SetupModal } from "@/components/SetupModal"
 import { useTheme } from "@/hooks/useTheme"
 import { SpaceList } from "@/pages/SpaceList"
 import { SpaceDetail } from "@/pages/SpaceDetail"
@@ -15,7 +17,8 @@ import { AdminNavDot } from "@/components/update-check/AdminNavDot"
 import { UpdateStatusProvider } from "@/components/update-check/UpdateStatusProvider"
 import { CreateAgentChat } from "@/components/CreateAgentChat"
 import { SpaceDetailLoadError } from "@/components/space-access/SpaceAccessChrome"
-import { ApiError, getSpaceDetail } from "@/lib/api"
+import { ApiError, getSpaceDetail, getStorageStatus } from "@/lib/api"
+import type { StorageStatus } from "@/types"
 import {
   LIST_ROUTE,
   buildAppRouteUrl,
@@ -69,8 +72,28 @@ export default function App() {
   return <WorkbenchApp />
 }
 
+const SETUP_DISMISSED_KEY = "genie-workbench-setup-dismissed"
+
 function WorkbenchApp() {
   useTheme()
+  // First-run storage setup: until an admin picks where the app's Delta state
+  // lives, show the Setup dialog (dismissible for this browser session — the
+  // app still works, but state is not kept across restarts).
+  const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null)
+  const [setupDismissed, setSetupDismissed] = useState<boolean>(() => {
+    try { return sessionStorage.getItem(SETUP_DISMISSED_KEY) === "1" } catch { return false }
+  })
+  useEffect(() => {
+    let cancelled = false
+    getStorageStatus()
+      .then((st) => { if (!cancelled) setStorageStatus(st) })
+      .catch(() => { /* status is advisory; never block the app on it */ })
+    return () => { cancelled = true }
+  }, [])
+  const dismissSetup = () => {
+    setSetupDismissed(true)
+    try { sessionStorage.setItem(SETUP_DISMISSED_KEY, "1") } catch { /* ignore */ }
+  }
   const [route, setRoute] = useState<AppRoute>(initialRoute)
   const [detailState, setDetailState] = useState<DetailState | null>(null)
   const [detailError, setDetailError] = useState<DetailError | null>(null)
@@ -167,6 +190,13 @@ function WorkbenchApp() {
     <ErrorBoundary>
     <UpdateStatusProvider>
     <div className="min-h-screen bg-background text-primary">
+      {storageStatus && !storageStatus.configured && !setupDismissed && (
+        <SetupModal
+          status={storageStatus}
+          onComplete={() => window.location.reload()}
+          onDismiss={dismissSetup}
+        />
+      )}
       {/* Top header */}
       <header className="sticky top-0 z-50 bg-surface/80 backdrop-blur-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between">
@@ -221,7 +251,10 @@ function WorkbenchApp() {
             </button>
           </nav>
 
-          <ThemeToggle />
+          <div className="flex items-center gap-1">
+            <WorkspaceSwitcher />
+            <ThemeToggle />
+          </div>
         </div>
         <div className="header-accent-line" />
       </header>

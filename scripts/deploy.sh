@@ -292,7 +292,10 @@ uv run --frozen python "$SCRIPT_DIR/grant_permissions.py" \
     --app-name "$APP_NAME" \
     --catalog "$CATALOG" \
     --schema "$GSO_SCHEMA" \
-    --warehouse-id "$WAREHOUSE_ID"
+    --warehouse-id "$WAREHOUSE_ID" \
+    --workspaces-secret-scope "$WORKSPACES_SECRET_SCOPE" \
+    --state-catalog "$STATE_CATALOG" \
+    --state-schema "$STATE_SCHEMA"
 echo "  ✓ UC grants applied"
 
 # ── Deploy optimization job via bundle ────────────────────────────────────
@@ -476,7 +479,11 @@ PATCHED_APP_YAML="/tmp/app.yaml.patched"
 cp "$PROJECT_DIR/app.yaml" "$PATCHED_APP_YAML"
 sed -i.bak "s|__WAREHOUSE_ID__|$WAREHOUSE_ID|" "$PATCHED_APP_YAML"
 sed -i.bak "s|__GSO_CATALOG__|$CATALOG|" "$PATCHED_APP_YAML"
-sed -i.bak "s|__LAKEBASE_INSTANCE__|$LAKEBASE_INSTANCE|" "$PATCHED_APP_YAML"
+# Workbench Delta state location: optional — empty means an admin picks it in
+# the app's first-run Setup dialog.
+sed -i.bak "s|__WORKBENCH_STATE_CATALOG__|${STATE_CATALOG}|" "$PATCHED_APP_YAML"
+sed -i.bak "s|__WORKBENCH_STATE_SCHEMA__|${STATE_SCHEMA}|" "$PATCHED_APP_YAML"
+sed -i.bak "s|__WORKSPACES_SECRET_SCOPE__|${WORKSPACES_SECRET_SCOPE}|" "$PATCHED_APP_YAML"
 sed -i.bak "s|__LLM_MODEL__|$LLM_MODEL|" "$PATCHED_APP_YAML"
 sed -i.bak "s|__GENIE_LLM_ROUTE__|$LLM_ROUTE|" "$PATCHED_APP_YAML"
 sed -i.bak "s|__GENIE_BYOK_ENABLED__|$BYOK_ENABLED|" "$PATCHED_APP_YAML"
@@ -535,7 +542,7 @@ fi
 
 databricks workspace import "$WS_PATH/app.yaml" \
     --profile "$PROFILE" --file "$PATCHED_APP_YAML" --format AUTO --overwrite 2>/dev/null && \
-echo "  ✓ app.yaml patched (WAREHOUSE=$WAREHOUSE_ID, GSO_CATALOG=$CATALOG, GSO_JOB_ID=${JOB_ID:-<none>}, LAKEBASE_INSTANCE=$LAKEBASE_INSTANCE, LLM_MODEL=$LLM_MODEL, LLM_ROUTE=$LLM_ROUTE, BYOK=$BYOK_ENABLED, MLFLOW=${MLFLOW_EXPERIMENT_ID:-<disabled>}, VC_OBSERVE=${VC_WS_ID:+enabled}${VC_WS_ID:-fail-closed}@${CATALOG}.${GSO_SCHEMA})" || \
+echo "  ✓ app.yaml patched (WAREHOUSE=$WAREHOUSE_ID, GSO_CATALOG=$CATALOG, GSO_JOB_ID=${JOB_ID:-<none>}, STATE=${STATE_CATALOG:-<setup dialog>}${STATE_CATALOG:+.$STATE_SCHEMA}, LLM_MODEL=$LLM_MODEL, LLM_ROUTE=$LLM_ROUTE, BYOK=$BYOK_ENABLED, MLFLOW=${MLFLOW_EXPERIMENT_ID:-<disabled>}, VC_OBSERVE=${VC_WS_ID:+enabled}${VC_WS_ID:-fail-closed}@${CATALOG}.${GSO_SCHEMA})" || \
 echo "  ⚠ Could not patch app.yaml — config may not be set"
 case "$UPDATE_CHECK" in
     true)  echo "  ℹ Daily release check: ON (set at install; runs in users' browsers on the Admin tab against api.github.com)" ;;
@@ -568,37 +575,6 @@ else
     echo "  ✓ App compute is already ACTIVE"
 fi
 
-# ── Set up Lakebase Autoscaling (if configured) ──────────────────────────
-if [ -n "$LAKEBASE_INSTANCE" ] && [ -n "$SP_CLIENT_ID" ]; then
-    echo "  Setting up Lakebase Autoscaling..."
-    uv run --frozen python "$SCRIPT_DIR/setup_lakebase.py" \
-        --profile "$PROFILE" \
-        --project-name "$LAKEBASE_INSTANCE" \
-        --sp-client-id "$SP_CLIENT_ID" 2>&1 || \
-    echo "  ⚠ Lakebase setup had errors — app will fall back to in-memory storage"
-fi
-
-# ── Resolve Lakebase database ID (needed for postgres resource) ───────────
-LAKEBASE_DB_RESOURCE=""
-if [ -n "$LAKEBASE_INSTANCE" ]; then
-    LAKEBASE_DB_RESOURCE=$(databricks api get "/api/2.0/postgres/projects/$LAKEBASE_INSTANCE/branches/production/databases" \
-        --profile "$PROFILE" -o json 2>/dev/null \
-        | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    dbs = data.get('databases', [])
-    if dbs:
-        print(dbs[0]['name'])
-except Exception: pass
-" 2>/dev/null || true)
-    if [ -n "$LAKEBASE_DB_RESOURCE" ]; then
-        echo "  ✓ Lakebase database: $LAKEBASE_DB_RESOURCE"
-    else
-        echo "  ⚠ Could not resolve Lakebase database ID — postgres resource won't be auto-configured"
-    fi
-fi
-
 # ── Configure app scopes and resources ───────────────────────────────────
 # The PATCH API is the mechanism that configures both user_api_scopes and
 # resources on a Databricks App. app.yaml user_api_scopes are documentation
@@ -616,33 +592,20 @@ scopes = ['sql', 'dashboards.genie', 'serving.serving-endpoints', 'ai-gateway',
 
 # Start with existing resources. The PATCH API replaces all resources,
 # so we must include everything. Preserve all resources that either have
-# full config or are referenced by app.yaml (e.g. postgres for Lakebase).
+# full config or are referenced by app.yaml. A 'postgres' (Lakebase) resource
+# from an older install is dropped: state now lives in Delta tables.
 existing = json.loads('$EXISTING_RESOURCES')
-app_yaml_resources = {'sql-warehouse', 'postgres'}  # referenced by valueFrom in app.yaml
+app_yaml_resources = {'sql-warehouse'}  # referenced by valueFrom in app.yaml
 by_name = {}
 for r in existing:
     has_config = any(k for k in r if k != 'name')
+    if r.get('name') == 'postgres' or 'postgres' in r or 'database' in r:
+        continue
     if has_config or r.get('name') in app_yaml_resources:
         by_name[r['name']] = r
 
 # Ensure sql-warehouse is set with the correct ID
 by_name['sql-warehouse'] = {'name': 'sql-warehouse', 'sql_warehouse': {'id': '$WAREHOUSE_ID', 'permission': 'CAN_USE'}}
-
-# Ensure postgres resource has full config when Lakebase is configured.
-# The database field requires the full resource path (e.g.
-# projects/<name>/branches/production/databases/<db-id>), not just the
-# postgres database name.
-lakebase_db = '$LAKEBASE_DB_RESOURCE'
-if lakebase_db:
-    branch = '/'.join(lakebase_db.split('/')[:4])  # projects/<name>/branches/<branch>
-    by_name['postgres'] = {
-        'name': 'postgres',
-        'postgres': {
-            'branch': branch,
-            'database': lakebase_db,
-            'permission': 'CAN_CONNECT_AND_CREATE',
-        }
-    }
 
 print(json.dumps({'user_api_scopes': scopes, 'resources': list(by_name.values())}))
 ")
@@ -786,7 +749,8 @@ else
     echo "  The app may need a minute to finish starting."
 fi
 echo ""
-echo "  NOTE: If you see 'Failed to list spaces' in the app and need"
-echo "  persistent storage, set GENIE_LAKEBASE_INSTANCE and rerun"
-echo "  ./scripts/deploy.sh --update to provision and attach Lakebase."
+if [ -z "$STATE_CATALOG" ]; then
+    echo "  NEXT: open the app as a workspace admin and complete the Setup"
+    echo "  dialog to choose where the app keeps its Delta state tables."
+fi
 echo "═══════════════════════════════════════════════════════════════"

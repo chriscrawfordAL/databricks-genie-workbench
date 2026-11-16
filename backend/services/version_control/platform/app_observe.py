@@ -124,6 +124,10 @@ def capture_initial_version(request, space_id: str) -> None:
     runtime = getattr(request.app.state, "vc_observe", None)
     if runtime is None:
         return
+    # VC is bound to the home workspace's control plane; a space created in a
+    # remote (cross-workspace) target is not captured.
+    if getattr(request.state, "target_workspace_id", ""):
+        return
     if runtime.flags.enabled("vc_writes_enabled") is not True:
         return
     auth = getattr(request.state, "vc_auth", None)

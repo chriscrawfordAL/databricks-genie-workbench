@@ -1419,3 +1419,105 @@ export interface AppVersionInfo {
   release_url: string | null
   update_check: UpdateCheckState
 }
+
+// ── Cross-workspace connections (other workspaces in the same account) ──
+export type WorkspaceAuthMode = "app_sp" | "custom_sp"
+
+export interface WorkspaceConnection {
+  /** Connection id (ws_<hex>) — not the numeric Databricks workspace id. */
+  workspace_id: string
+  name: string
+  host: string
+  auth_mode: WorkspaceAuthMode
+  client_id?: string | null
+  /** Numeric Databricks workspace id, once the connection has been probed. */
+  remote_workspace_id?: string | null
+  warehouse_id?: string | null
+  status: string // active | active_no_system_tables | error | unknown
+  status_detail?: string | null
+  created_by?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface WorkspaceConnectionCreate {
+  name: string
+  host: string
+  auth_mode: WorkspaceAuthMode
+  client_id?: string
+  client_secret?: string
+  warehouse_id?: string
+}
+
+export interface WorkspaceConnectionUpdate {
+  name?: string
+  host?: string
+  client_id?: string
+  client_secret?: string
+  warehouse_id?: string
+}
+
+export interface WorkspaceTestResult {
+  ok: boolean
+  status: string
+  detail: string
+  user?: string | null
+  remote_workspace_id?: string | null
+  system_tables: boolean
+  warehouses: number
+}
+
+export interface WorkspacesInfo {
+  app_sp_client_id?: string | null
+  home_host?: string | null
+  secret_scope: string
+}
+
+// Cross-workspace data-transfer observability (app-observed egress proxy)
+export interface TransferByCategory {
+  genie: number
+  sql: number
+  system_tables: number
+  other: number
+}
+
+export interface WorkspaceTransfer {
+  workspace_id: string
+  name?: string | null
+  host?: string | null
+  total_bytes: number
+  requests: number
+  by_category: TransferByCategory
+}
+
+export interface TransferDailyPoint {
+  day: string
+  bytes: number
+}
+
+export interface TransferSummary {
+  days: number
+  total_bytes: number
+  total_requests: number
+  workspaces: WorkspaceTransfer[]
+  daily: TransferDailyPoint[]
+}
+
+// ── Workbench storage setup (Delta state location) ──
+export interface StorageStatus {
+  configured: boolean
+  available: boolean
+  catalog?: string | null
+  schema?: string | null
+  /** setup | env | none */
+  source: string
+  last_error?: string | null
+  pending_writes: number
+  is_admin: boolean
+  suggested_catalog?: string | null
+  suggested_schema?: string | null
+}
+
+export interface UcNamed {
+  name: string
+}

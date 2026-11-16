@@ -41,15 +41,15 @@ export function Settings() {
       <Card className="p-4">
         <h2 className="mb-3 text-sm font-medium uppercase text-muted">Health</h2>
         <div className="grid gap-2 text-sm sm:grid-cols-2">
-          <Row k="Lakebase">
+          <Row k="App storage (Delta)">
             <Badge
               className={
-                health?.lakebase_available
+                health?.storage_available
                   ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30'
                   : 'bg-amber-500/20 text-amber-400 border-amber-500/30'
               }
             >
-              {health?.lakebase_available ? 'connected' : 'in-memory fallback'}
+              {health?.storage_available ? 'connected' : 'in-memory (setup pending)'}
             </Badge>
           </Row>
           <Row k="Warehouse"><span className="font-mono text-xs">{health?.warehouse_id || '—'}</span></Row>

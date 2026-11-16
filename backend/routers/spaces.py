@@ -10,7 +10,7 @@ from backend.routers._validators import SpaceId
 
 from backend.services.auth import get_workspace_client, require_obo_workspace_client
 from backend.services.genie_client import list_genie_spaces
-from backend.services.lakebase import (
+from backend.services.state_store import (
     get_latest_score,
     get_latest_scores_batch,
     get_score_history,
@@ -64,7 +64,7 @@ async def list_spaces(
         try:
             starred_ids = await get_starred_spaces()
         except Exception as e:
-            logger.warning(f"Lakebase unavailable for starred spaces, using empty list: {e}")
+            logger.warning(f"State store unavailable for starred spaces, using empty list: {e}")
             starred_ids = []
         starred_set = set(starred_ids)
 

@@ -1,7 +1,7 @@
 """Session management for the Create Genie Agent.
 
 Maintains conversation history and accumulated state per session.
-Persists to Lakebase (PostgreSQL) when available, falls back to in-memory.
+Persists to the Workbench Delta state store when configured, falls back to in-memory.
 """
 
 import asyncio
@@ -63,142 +63,79 @@ class AgentSession:
 
 
 # ---------------------------------------------------------------------------
-# In-memory cache (always used as L1; Lakebase is the durable L2)
+# In-memory cache (always used as L1; the Delta state store is the durable L2)
 # ---------------------------------------------------------------------------
+
 _sessions: dict[str, AgentSession] = {}
 
-
-def _get_pool():
-    """Return the shared Lakebase connection pool (if available)."""
-    from backend.services.lakebase import _pool, _lakebase_available
-    if _lakebase_available and _pool is not None:
-        return _pool
-    return None
+_STORE = "agent_sessions"
 
 
 async def _ensure_table() -> None:
-    """Idempotently create the agent_sessions table in Lakebase."""
-    pool = _get_pool()
-    if pool is None:
-        return
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS genie.agent_sessions (
-                    session_id   TEXT PRIMARY KEY,
-                    history      JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    space_config JSONB,
-                    space_id     TEXT,
-                    space_url    TEXT,
-                    selected_catalogs JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    selected_schemas  JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    selected_tables   JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    feasibility_confirmed BOOLEAN NOT NULL DEFAULT false,
-                    llm_model    TEXT,
-                    created_at   DOUBLE PRECISION NOT NULL,
-                    last_active  DOUBLE PRECISION NOT NULL
-                )
-            """)
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_agent_sessions_last_active
-                ON genie.agent_sessions (last_active)
-            """)
-            # Migrate existing tables: add columns introduced in the discovery/feasibility update
-            for col_sql in [
-                "ALTER TABLE genie.agent_sessions ADD COLUMN IF NOT EXISTS selected_catalogs JSONB NOT NULL DEFAULT '[]'::jsonb",
-                "ALTER TABLE genie.agent_sessions ADD COLUMN IF NOT EXISTS selected_schemas JSONB NOT NULL DEFAULT '[]'::jsonb",
-                "ALTER TABLE genie.agent_sessions ADD COLUMN IF NOT EXISTS selected_tables JSONB NOT NULL DEFAULT '[]'::jsonb",
-                "ALTER TABLE genie.agent_sessions ADD COLUMN IF NOT EXISTS feasibility_confirmed BOOLEAN NOT NULL DEFAULT false",
-                "ALTER TABLE genie.agent_sessions ADD COLUMN IF NOT EXISTS llm_model TEXT",
-            ]:
-                try:
-                    await conn.execute(col_sql)
-                except Exception:
-                    pass  # Column already exists
-        logger.info("agent_sessions table ready")
-    except Exception as e:
-        logger.warning(f"Failed to ensure agent_sessions table: {e}")
+    """Kept for lifecycle compatibility — the state store owns its table."""
+    return None
+
+
+def _to_record(session: AgentSession) -> dict:
+    return {
+        "session_id": session.session_id,
+        "history": session.history,
+        "space_config": session.space_config,
+        "space_id": session.space_id,
+        "space_url": session.space_url,
+        "selected_catalogs": session.selected_catalogs,
+        "selected_schemas": session.selected_schemas,
+        "selected_tables": session.selected_tables,
+        "feasibility_confirmed": session.feasibility_confirmed,
+        "continuation_count": session.continuation_count,
+        "llm_model": session.llm_model,
+        "created_at": session.created_at,
+        "last_active": session.last_active,
+    }
+
+
+def _from_record(rec: dict) -> AgentSession:
+    return AgentSession(
+        session_id=rec["session_id"],
+        history=rec.get("history") or [],
+        created_at=float(rec.get("created_at") or time.time()),
+        last_active=float(rec.get("last_active") or time.time()),
+        space_config=rec.get("space_config"),
+        space_id=rec.get("space_id"),
+        space_url=rec.get("space_url"),
+        selected_catalogs=rec.get("selected_catalogs") or [],
+        selected_schemas=rec.get("selected_schemas") or [],
+        selected_tables=rec.get("selected_tables") or [],
+        feasibility_confirmed=bool(rec.get("feasibility_confirmed")),
+        continuation_count=int(rec.get("continuation_count") or 0),
+        llm_model=rec.get("llm_model"),
+    )
 
 
 async def _persist(session: AgentSession) -> None:
-    """Write session state to Lakebase (fire-and-forget safe)."""
-    pool = _get_pool()
-    if pool is None:
-        return
+    """Queue the session for a durable write (fire-and-forget safe)."""
+    from backend.services import state_store
+
     try:
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO genie.agent_sessions
-                    (session_id, history, space_config, space_id, space_url,
-                     selected_catalogs, selected_schemas, selected_tables,
-                     feasibility_confirmed, llm_model, created_at, last_active)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                ON CONFLICT (session_id) DO UPDATE SET
-                    history      = EXCLUDED.history,
-                    space_config = EXCLUDED.space_config,
-                    space_id     = EXCLUDED.space_id,
-                    space_url    = EXCLUDED.space_url,
-                    selected_catalogs     = EXCLUDED.selected_catalogs,
-                    selected_schemas      = EXCLUDED.selected_schemas,
-                    selected_tables       = EXCLUDED.selected_tables,
-                    feasibility_confirmed = EXCLUDED.feasibility_confirmed,
-                    llm_model    = EXCLUDED.llm_model,
-                    last_active  = EXCLUDED.last_active
-            """,
-                session.session_id,
-                json.dumps(session.history),
-                json.dumps(session.space_config) if session.space_config else None,
-                session.space_id,
-                session.space_url,
-                json.dumps(session.selected_catalogs),
-                json.dumps(session.selected_schemas),
-                json.dumps(session.selected_tables),
-                session.feasibility_confirmed,
-                session.llm_model,
-                session.created_at,
-                session.last_active,
-            )
+        await state_store.kv_put(_STORE, session.session_id, _to_record(session))
     except Exception as e:
         logger.warning(f"Failed to persist session {session.session_id}: {e}")
 
 
 async def _load(session_id: str) -> AgentSession | None:
-    """Try to load a session from Lakebase."""
-    pool = _get_pool()
-    if pool is None:
-        return None
-    try:
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM genie.agent_sessions WHERE session_id = $1",
-                session_id,
-            )
-        if row is None:
-            return None
-        try:
-            llm_model = row["llm_model"]
-        except (KeyError, IndexError):
-            llm_model = None
+    """Try to load a session from the durable store."""
+    from backend.services import state_store
 
-        session = AgentSession(
-            session_id=row["session_id"],
-            history=json.loads(row["history"]),
-            created_at=row["created_at"],
-            last_active=row["last_active"],
-            space_config=json.loads(row["space_config"]) if row["space_config"] else None,
-            space_id=row["space_id"],
-            space_url=row["space_url"],
-            selected_catalogs=json.loads(row["selected_catalogs"]) if row["selected_catalogs"] else [],
-            selected_schemas=json.loads(row["selected_schemas"]) if row["selected_schemas"] else [],
-            selected_tables=json.loads(row["selected_tables"]) if row["selected_tables"] else [],
-            feasibility_confirmed=row["feasibility_confirmed"] if row["feasibility_confirmed"] is not None else False,
-            llm_model=llm_model,
-        )
+    try:
+        rec = await state_store.kv_get_durable(_STORE, session_id)
+        if not rec:
+            return None
+        session = _from_record(rec)
         if session.is_expired():
             return None
         return session
     except Exception as e:
-        logger.warning(f"Failed to load session {session_id} from Lakebase: {e}")
+        logger.warning(f"Failed to load session {session_id}: {e}")
         return None
 
 
@@ -229,21 +166,21 @@ def get_session(session_id: str) -> AgentSession | None:
 
 
 async def get_session_async(session_id: str) -> AgentSession | None:
-    """Get session: tries in-memory first, falls back to Lakebase."""
+    """Get session: tries in-memory first, falls back to the durable store."""
     session = get_session(session_id)
     if session is not None:
         return session
-    # L2: Lakebase
+    # L2: Delta state store
     session = await _load(session_id)
     if session is not None:
         session.last_active = time.time()
         _sessions[session_id] = session  # promote to L1
-        logger.info(f"Restored session {session_id} from Lakebase")
+        logger.info(f"Restored session {session_id} from the state store")
     return session
 
 
 async def persist_session(session: AgentSession) -> None:
-    """Persist session to Lakebase (non-blocking best-effort)."""
+    """Persist session to the durable store (non-blocking best-effort)."""
     await _persist(session)
 
 
@@ -253,20 +190,16 @@ def delete_session(session_id: str) -> bool:
 
 
 async def delete_session_async(session_id: str) -> bool:
-    """Delete from both in-memory and Lakebase."""
+    """Delete from both the in-memory cache and the durable store."""
+    from backend.services import state_store
+
     existed = _sessions.pop(session_id, None) is not None
-    pool = _get_pool()
-    if pool:
-        try:
-            async with pool.acquire() as conn:
-                result = await conn.execute(
-                    "DELETE FROM genie.agent_sessions WHERE session_id = $1",
-                    session_id,
-                )
-                if "DELETE 1" in result:
-                    existed = True
-        except Exception as e:
-            logger.warning(f"Failed to delete session {session_id} from Lakebase: {e}")
+    if not existed:
+        existed = (await _load(session_id)) is not None
+    try:
+        await state_store.kv_delete(_STORE, session_id)
+    except Exception as e:
+        logger.warning(f"Failed to delete session {session_id}: {e}")
     return existed
 
 

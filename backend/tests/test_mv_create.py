@@ -2824,19 +2824,14 @@ def test_drop_asks_run_space_access_before_owner_check(client, monkeypatch):
 
 
 def test_drop_rejects_a_malformed_run_id_before_any_io(client, monkeypatch):
-    """A non-uuid body run_id is a 422 before the run gate touches Lakebase or Delta."""
+    """A non-uuid body run_id is a 422 before the run gate touches Delta."""
     monkeypatch.setattr(auto_optimize, "_load_run_envelope", _REAL_LOAD_RUN_ENVELOPE)
     touched: list[str] = []
-
-    async def lakebase_miss(run_id):
-        touched.append(f"lakebase:{run_id}")
-        return None
 
     def delta(sql, *, strict=False):
         touched.append(sql)
         return []
 
-    monkeypatch.setattr(auto_optimize.gso_lakebase, "load_gso_run", lakebase_miss)
     monkeypatch.setattr(auto_optimize, "_delta_query", delta)
 
     resp = client.post(

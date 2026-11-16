@@ -64,6 +64,121 @@ class StarToggleRequest(BaseModel):
     starred: bool
 
 
+# ===== Cross-workspace connections (remote workspaces in the same account) =====
+
+class WorkspaceConnection(BaseModel):
+    """A remote workspace the app can target (no secret material)."""
+    workspace_id: str  # connection id (ws_<hex>); not the numeric Databricks workspace id
+    name: str
+    host: str
+    auth_mode: Literal["app_sp", "custom_sp"] = "custom_sp"
+    client_id: str | None = None
+    remote_workspace_id: str | None = None  # numeric Databricks workspace id, once probed
+    warehouse_id: str | None = None  # SQL warehouse in the remote workspace (optional)
+    status: str = "unknown"  # active | active_no_system_tables | error | unknown
+    status_detail: str | None = None
+    created_by: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class WorkspaceConnectionCreate(BaseModel):
+    """Request to add a remote workspace connection."""
+    name: str = Field(..., min_length=1, max_length=128)
+    host: str = Field(..., min_length=1, max_length=512)
+    auth_mode: Literal["app_sp", "custom_sp"] = "custom_sp"
+    client_id: str | None = Field(None, min_length=1, max_length=256)
+    client_secret: str | None = Field(None, min_length=1, max_length=1024)
+    warehouse_id: str | None = Field(None, max_length=64)
+
+
+class WorkspaceConnectionUpdate(BaseModel):
+    """Request to update a remote workspace connection. Omitted fields unchanged."""
+    name: str | None = Field(None, min_length=1, max_length=128)
+    host: str | None = Field(None, min_length=1, max_length=512)
+    client_id: str | None = Field(None, min_length=1, max_length=256)
+    client_secret: str | None = Field(None, min_length=1, max_length=1024)
+    warehouse_id: str | None = Field(None, max_length=64)
+
+
+class WorkspaceTestResult(BaseModel):
+    """Result of probing a remote workspace connection."""
+    ok: bool
+    status: str
+    detail: str = ""
+    user: str | None = None
+    remote_workspace_id: str | None = None
+    system_tables: bool = False
+    warehouses: int = 0
+
+
+class WorkspacesInfo(BaseModel):
+    """Context the Workspaces admin tab needs to explain the setup steps."""
+    app_sp_client_id: str | None = None
+    home_host: str | None = None
+    secret_scope: str
+
+
+class TransferByCategory(BaseModel):
+    """Bytes pulled in from a workspace, split by operation category."""
+    genie: int = 0
+    sql: int = 0
+    system_tables: int = 0
+    other: int = 0
+
+
+class WorkspaceTransfer(BaseModel):
+    """Per-remote-workspace data-transfer rollup (app-observed egress proxy)."""
+    workspace_id: str
+    name: str | None = None
+    host: str | None = None
+    total_bytes: int = 0
+    requests: int = 0
+    by_category: TransferByCategory = Field(default_factory=TransferByCategory)
+
+
+class TransferDailyPoint(BaseModel):
+    """Bytes pulled in across all remote workspaces on a single UTC day."""
+    day: str
+    bytes: int = 0
+
+
+class TransferSummary(BaseModel):
+    """Cross-workspace data-transfer observability for the admin tab."""
+    days: int
+    total_bytes: int = 0
+    total_requests: int = 0
+    workspaces: list[WorkspaceTransfer] = Field(default_factory=list)
+    daily: list[TransferDailyPoint] = Field(default_factory=list)
+
+
+# ===== Workbench storage setup (Delta state location) =====
+
+class StorageStatus(BaseModel):
+    """Where the Workbench keeps its Delta state, and whether it is usable."""
+    configured: bool
+    available: bool
+    catalog: str | None = None
+    schema_name: str | None = Field(None, alias="schema")
+    source: str = "none"  # setup | env | none
+    last_error: str | None = None
+    pending_writes: int = 0
+    is_admin: bool = False
+    suggested_catalog: str | None = None
+    suggested_schema: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class StorageSetupRequest(BaseModel):
+    """Admin request to choose (and optionally create) the state schema."""
+    catalog: str = Field(..., min_length=1, max_length=255)
+    schema_name: str = Field(..., min_length=1, max_length=255, alias="schema")
+    create_schema: bool = False
+
+    model_config = {"populate_by_name": True}
+
+
 class AdminDashboardStats(BaseModel):
     """Org-wide statistics for the admin dashboard."""
     total_spaces: int

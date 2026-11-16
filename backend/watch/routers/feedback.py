@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Query
 
-from backend.services import lakebase
+from backend.services import state_store
 from backend.watch._validators import validate_days
 from backend.watch.models import (
     FeedbackEvent,
@@ -69,10 +69,10 @@ async def get_feedback(
 ) -> dict:
     days = validate_days(days, default=7)
 
-    # Workspace boundary: live Genie listing with Lakebase fallback.
+    # Workspace boundary: live Genie listing with cached-list fallback.
     spaces = await asyncio.to_thread(_safe, genie_client.list_genie_spaces)
     if not spaces:
-        spaces = await lakebase.watch_list_cached_spaces() or []
+        spaces = await state_store.watch_list_cached_spaces() or []
 
     visible: dict[str, dict] = {}
     for s in spaces:

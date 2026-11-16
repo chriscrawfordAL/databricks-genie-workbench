@@ -16,6 +16,8 @@ def _heal_calls(monkeypatch, *, job_id, sp_client):
     calls: list = []
     monkeypatch.setenv("GSO_JOB_ID", job_id)
     monkeypatch.setattr(auth, "get_service_principal_client", sp_client)
+    # The job is home-workspace state; startup heals it with the home SP.
+    monkeypatch.setattr(auth, "get_home_service_principal_client", sp_client, raising=False)
     monkeypatch.setattr(job_launcher, "ensure_job_run_as", lambda *args: calls.append(args))
     return calls
 

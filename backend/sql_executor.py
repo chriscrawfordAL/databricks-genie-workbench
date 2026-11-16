@@ -59,12 +59,31 @@ def validate_sql_read_only(sql: str) -> None:
 
 
 def get_sql_warehouse_id() -> str | None:
-    """Get the SQL Warehouse ID from environment or auto-detect one.
+    """Get the SQL Warehouse ID for the current context.
 
-    Priority:
-    1. SQL_WAREHOUSE_ID env var (explicit config)
+    Home workspace:
+    1. SQL_WAREHOUSE_ID env var (the app's warehouse resource)
     2. Auto-detect: first running Pro/Serverless warehouse the user can access
+
+    Remote target workspace (cross-workspace): the home warehouse does not exist
+    there, so use the connection's configured warehouse, else auto-detect one
+    the remote service principal can access (cached per connection).
     """
+    from backend.services.auth import get_target_warehouse_id, get_target_workspace_id
+
+    target = get_target_workspace_id()
+    if target:
+        configured = get_target_warehouse_id()
+        if configured:
+            return configured
+        cached = _remote_warehouse_cache.get(target)
+        if cached:
+            return cached
+        detected = _auto_detect_warehouse(include_stopped=True)
+        if detected:
+            _remote_warehouse_cache[target] = detected
+        return detected
+
     configured = os.environ.get("SQL_WAREHOUSE_ID")
     if configured:
         return configured
@@ -72,11 +91,16 @@ def get_sql_warehouse_id() -> str | None:
     return _auto_detect_warehouse()
 
 
-def _auto_detect_warehouse() -> str | None:
-    """Find a running SQL warehouse the current user has access to.
+# connection id -> auto-detected warehouse id in that remote workspace
+_remote_warehouse_cache: dict[str, str] = {}
 
-    Prefers serverless > pro, running > starting. Returns None if nothing
-    is available.
+
+def _auto_detect_warehouse(include_stopped: bool = False) -> str | None:
+    """Find a running SQL warehouse the current principal has access to.
+
+    Prefers serverless > pro. With ``include_stopped`` (remote workspaces, where
+    there is no configured warehouse), falls back to a stopped Pro/Serverless
+    warehouse, which auto-starts on first query. Returns None if nothing fits.
     """
     try:
         client = get_workspace_client()
@@ -86,17 +110,21 @@ def _auto_detect_warehouse() -> str | None:
         return None
 
     running = []
+    stopped = []
     for wh in warehouses:
-        state = str(getattr(wh, "state", "")).upper()
-        if state != "RUNNING":
+        state = str(getattr(getattr(wh, "state", ""), "value", getattr(wh, "state", ""))).upper()
+        is_running = state == "RUNNING"
+        if not is_running and not include_stopped:
             continue
         is_serverless = getattr(wh, "enable_serverless_compute", False)
         warehouse_type = getattr(wh, "warehouse_type", "")
         wh_type_str = getattr(warehouse_type, "value", warehouse_type)
         is_pro = wh_type_str == "PRO"
         if is_serverless or is_pro:
-            running.append((is_serverless, wh))
+            (running if is_running else stopped).append((is_serverless, wh))
 
+    if not running:
+        running = stopped
     if not running:
         return None
 
@@ -207,6 +235,9 @@ def execute_sql(
         truncated = False
         if response.result and response.result.data_array:
             data = response.result.data_array
+            # Count bytes pulled in when this is a remote (cross-workspace) query.
+            from backend.services import transfer_meter
+            transfer_meter.record_current(transfer_meter.CATEGORY_SQL, data)
         if response.manifest:
             truncated = response.manifest.truncated or False
 

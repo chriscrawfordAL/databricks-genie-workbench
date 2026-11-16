@@ -3,7 +3,7 @@ and history rows carry none of the scan (MV-D110)."""
 
 import json
 
-from backend.services import lakebase
+from backend.services import state_store
 from backend.services.scanner import calculate_score, redact_for_viewer
 
 _NOISY = ["etl_batch_id", "raw_payload_json", "debug_flag", "audit_user", "col_1", "load_timestamp"]
@@ -99,14 +99,13 @@ def test_an_older_scorer_s_wording_is_blank_not_shown():
 
 
 async def test_memory_mode_history_rows_carry_only_score_maturity_accuracy_and_time(monkeypatch):
-    monkeypatch.setattr(lakebase, "_lakebase_available", False)
-    monkeypatch.setattr(lakebase, "_pool", None)
-    monkeypatch.setattr(lakebase, "_memory_store", {**lakebase._memory_store, "scans": {}, "history": {}, "seen": set()})
+    monkeypatch.setattr(state_store, "_ready", False)
+    monkeypatch.setattr(state_store, "_memory_store", {**state_store._memory_store, "scans": {}, "history": {}, "seen": set()})
     scan = {**_scan(), "optimization_accuracy": 0.8}
     assert scan["findings"] and scan["warnings"] and scan["checks"]  # positive control
 
-    await lakebase.save_scan_result("s1", scan)
-    rows = await lakebase.get_score_history("s1")
+    await state_store.save_scan_result("s1", scan)
+    rows = await state_store.get_score_history("s1")
 
     assert rows == [{
         "score": scan["score"], "maturity": scan["maturity"],

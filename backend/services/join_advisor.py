@@ -4,7 +4,7 @@ The Semantic Blueprint's Join Advisor (v4 §7) proposes candidate joins that the
 Auto-Optimize run **validates and adds itself** (via ``add_join_spec``). Nothing
 in this module edits ``serialized_space``: the Workbench never makes ad-hoc Genie
 Agent config edits — that is the Genie product UI's job. A seeded candidate
-persists as advice (``lakebase.save_join_advice``) and is carried into the next
+persists as advice (``state_store.save_join_advice``) and is carried into the next
 run as run input; the optimizer re-probes it and only adds the ones that hold.
 
 Candidates are grounded, in increasing strength, in:

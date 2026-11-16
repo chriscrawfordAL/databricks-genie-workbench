@@ -11,6 +11,7 @@ import type { MvRerunPrefill } from "@/components/auto-optimize/OptimizationConf
 import { IQScoreTab } from "./IQScoreTab"
 import { HistoryTab } from "./HistoryTab"
 import { SpaceVersionControlTab } from "@/components/version-control/SpaceVersionControlTab"
+import { useWorkspace } from "@/hooks/WorkspaceContext"
 import { useAnalysis } from "@/hooks/useAnalysis"
 import { SpaceOverview } from "@/components/SpaceOverview"
 import { AutoOptimizeTab } from "@/components/auto-optimize/AutoOptimizeTab"
@@ -34,6 +35,7 @@ interface SpaceDetailProps {
 }
 
 export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, autoScan, onBack, onNavigate }: SpaceDetailProps) {
+  const { isRemote, selectedWorkspace } = useWorkspace()
   const [scanResult, setScanResult] = useState<ScanResult | null>(null)
   const [isStarred, setIsStarred] = useState(false)
   const [isScanning, setIsScanning] = useState(false)
@@ -193,13 +195,17 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, 
     }
   }, [activeTab, spaceId])
 
-  const tabs: { id: SpaceTab; label: string; icon: React.ReactNode }[] = [
+  // In another workspace (cross-workspace target) the Model advisors and
+  // Version Control are not available — both are bound to this app's home
+  // workspace. Score, Optimize and History work against the remote agent.
+  const allTabs: { id: SpaceTab; label: string; icon: React.ReactNode; homeOnly?: boolean }[] = [
     { id: "score", label: "Score", icon: <BarChart2 className="w-4 h-4" /> },
-    { id: "model", label: "Model", icon: <Network className="w-4 h-4" /> },
+    { id: "model", label: "Model", icon: <Network className="w-4 h-4" />, homeOnly: true },
     { id: "optimize", label: "Optimize", icon: <Rocket className="w-4 h-4" /> },
     { id: "history", label: "History", icon: <Clock className="w-4 h-4" /> },
-    { id: "versions", label: "Version Control", icon: <GitBranch className="w-4 h-4" /> },
+    { id: "versions", label: "Version Control", icon: <GitBranch className="w-4 h-4" />, homeOnly: true },
   ]
+  const tabs = allTabs.filter((t) => !(isRemote && t.homeOnly))
 
   // Determine contextual action(s) based on scan results
   const hasRemediationItems = scanResult && scanResult.maturity !== "Trusted" && (
@@ -380,10 +386,24 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, 
               </>
             )}
 
-            {activeTab === "model" && (
+            {activeTab === "model" && !isRemote && (
               canEdit ? <SemanticModelTab spaceId={spaceId} onReviewCreate={handleReviewProposal} />
                 : access === "checking" ? <CheckingAccess />
                 : <LockedSection title="Model" message={MODEL_NEEDS_EDIT} />
+            )}
+
+            {activeTab === "optimize" && isRemote && (
+              <div className="mb-3 rounded-lg border border-blue-500/30 bg-blue-500/5 px-4 py-3">
+                <h3 className="text-sm font-semibold text-primary">
+                  Optimizing an agent in {selectedWorkspace?.name ?? "another workspace"}
+                </h3>
+                <p className="text-sm text-muted mt-1">
+                  The optimization job runs in this app's home workspace (LLM calls, run history and MLflow stay
+                  here). Benchmark SQL, profiling and every agent update run in {selectedWorkspace?.name ?? "the other workspace"} as
+                  its service principal, on its SQL warehouse. That workspace connection must use a dedicated service
+                  principal with Can Manage on this agent and read access to its tables.
+                </p>
+              </div>
             )}
 
             {activeTab === "optimize" && (
@@ -409,7 +429,7 @@ export function SpaceDetail({ spaceId, displayName, spaceUrl, activeTab, runId, 
               <HistoryTab history={history} optimizationEvents={optimizationEvents} isLoading={isLoadingHistory} />
             )}
 
-            {activeTab === "versions" && (
+            {activeTab === "versions" && !isRemote && (
               <SpaceVersionControlTab spaceId={spaceId} access={access} accessReason={accessReason} />
             )}
           </div>

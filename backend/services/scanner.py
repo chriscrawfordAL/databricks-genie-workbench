@@ -5,7 +5,7 @@ Historical note: the pure scoring logic (``calculate_score``,
 lived in this module until it was extracted to
 ``genie_space_optimizer.iq_scan.scoring`` so the GSO optimizer preflight can
 share a single source of truth. This module now owns only the backend-specific
-IO: UC metadata enrichment, Lakebase persistence, and the async
+IO: UC metadata enrichment, Delta state persistence, and the async
 ``scan_space`` orchestration.
 """
 
@@ -18,7 +18,7 @@ from typing import Optional
 from databricks.sdk.errors import NotFound
 
 from backend.services.genie_client import get_genie_space, get_serialized_space
-from backend.services.lakebase import save_scan_result, get_latest_score, get_latest_optimization_run
+from backend.services.state_store import save_scan_result, get_latest_score, get_latest_optimization_run
 
 # Re-exported from the GSO iq_scan package so existing import paths keep working.
 from genie_space_optimizer.iq_scan.scoring import (  # noqa: F401
@@ -168,7 +168,7 @@ def _enrich_with_uc_descriptions(space_data: dict, ws) -> int:
 
 
 async def scan_space(space_id: str, user_token: Optional[str] = None) -> dict:
-    """Fetch space config, calculate IQ score, and persist to Lakebase.
+    """Fetch space config, calculate IQ score, and persist to the Workbench state store.
 
     Args:
         space_id: The Genie Agent ID
@@ -206,34 +206,33 @@ async def scan_space(space_id: str, user_token: Optional[str] = None) -> dict:
 
     async def _fetch_gso_runs():
         try:
-            from backend.services import gso_lakebase
-            runs = await gso_lakebase.load_gso_runs_for_space(space_id)
-            # Delta table fallback when Lakebase synced tables are empty
-            if not runs:
-                catalog = os.environ.get("GSO_CATALOG", "")
-                schema = os.environ.get("GSO_SCHEMA", "genie_space_optimizer")
-                wh_id = os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", "")
-                if catalog and wh_id:
-                    try:
-                        from genie_space_optimizer.common.warehouse import sql_warehouse_query
-                        from genie_space_optimizer.common.config import MV_ADVICE_RUN_EXCLUSION
-                        from backend.services.auth import get_service_principal_client
-                        ws = get_service_principal_client()
-                        # MV-D23 guardrail (ii): exclude sentinel advice runs so a
-                        # standalone suggest never poses as this space's latest
-                        # optimization run (it has no best_accuracy). Same pinned
-                        # predicate as the history surface.
-                        df = sql_warehouse_query(
-                            ws, wh_id,
-                            f"SELECT run_id, space_id, status, best_accuracy, completed_at, started_at "
-                            f"FROM {catalog}.{schema}.genie_opt_runs "
-                            f"WHERE space_id = '{space_id}' AND {MV_ADVICE_RUN_EXCLUSION} "
-                            f"ORDER BY started_at DESC"
-                        )
-                        if not df.empty:
-                            runs = df.to_dict(orient="records")
-                    except Exception as e:
-                        logger.warning(f"GSO Delta fallback failed for {space_id}: {e}")
+            # GSO run history lives in the GSO Delta tables (home workspace).
+            runs: list[dict] = []
+            catalog = os.environ.get("GSO_CATALOG", "")
+            schema = os.environ.get("GSO_SCHEMA", "genie_space_optimizer")
+            wh_id = os.environ.get("GSO_WAREHOUSE_ID") or os.environ.get("SQL_WAREHOUSE_ID", "")
+            if catalog and wh_id:
+                try:
+                    from genie_space_optimizer.common.warehouse import sql_warehouse_query
+                    from genie_space_optimizer.common.config import MV_ADVICE_RUN_EXCLUSION
+                    # GSO tables live in the home workspace's metastore.
+                    from backend.services.auth import get_home_service_principal_client
+                    ws = get_home_service_principal_client()
+                    # MV-D23 guardrail (ii): exclude sentinel advice runs so a
+                    # standalone suggest never poses as this space's latest
+                    # optimization run (it has no best_accuracy). Same pinned
+                    # predicate as the history surface.
+                    df = sql_warehouse_query(
+                        ws, wh_id,
+                        f"SELECT run_id, space_id, status, best_accuracy, completed_at, started_at "
+                        f"FROM {catalog}.{schema}.genie_opt_runs "
+                        f"WHERE space_id = '{space_id}' AND {MV_ADVICE_RUN_EXCLUSION} "
+                        f"ORDER BY started_at DESC"
+                    )
+                    if not df.empty:
+                        runs = df.to_dict(orient="records")
+                except Exception as e:
+                    logger.warning(f"GSO Delta fallback failed for {space_id}: {e}")
             return runs or []
         except Exception as e:
             logger.warning(f"Failed to check GSO runs for {space_id}: {e}")
@@ -263,7 +262,7 @@ async def scan_space(space_id: str, user_token: Optional[str] = None) -> dict:
     scan_result = calculate_score(space_data, optimization_run=optimization_run)
     scan_result["space_id"] = space_id
 
-    # Persist to Lakebase
+    # Persist to the Workbench state store
     try:
         await save_scan_result(space_id, scan_result)
         logger.info(f"Scan result saved for {space_id}: score={scan_result['score']}")

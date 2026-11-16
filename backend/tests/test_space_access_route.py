@@ -184,14 +184,13 @@ def test_space_detail_reads_concurrently_after_the_view_check(monkeypatch):
 def test_history_in_memory_mode_carries_no_scan_content_to_a_viewer(monkeypatch):
     import asyncio
 
-    from backend.services import lakebase
+    from backend.services import state_store
 
-    monkeypatch.setattr(lakebase, "_lakebase_available", False)
-    monkeypatch.setattr(lakebase, "_pool", None)
-    monkeypatch.setattr(lakebase, "_memory_store", {**lakebase._memory_store, "scans": {}, "history": {}, "seen": set()})
+    monkeypatch.setattr(state_store, "_ready", False)
+    monkeypatch.setattr(state_store, "_memory_store", {**state_store._memory_store, "scans": {}, "history": {}, "seen": set()})
     stored = _stored_scan()
     assert "First offender" in str(stored["warnings"])  # positive control
-    asyncio.run(lakebase.save_scan_result(_SPACE, stored))
+    asyncio.run(state_store.save_scan_result(_SPACE, stored))
 
     levels: list = []
 

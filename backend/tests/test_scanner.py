@@ -898,11 +898,30 @@ class TestScanSpaceGsoSelection:
     """
 
     @staticmethod
+    def _patch_gso_delta(monkeypatch, gso_runs):
+        """Serve the GSO run history (the genie_opt_runs Delta table) from rows."""
+        import pandas as pd
+        import backend.services.auth as auth
+        import genie_space_optimizer.common.warehouse as warehouse
+
+        monkeypatch.setenv("GSO_CATALOG", "main")
+        monkeypatch.setenv("GSO_WAREHOUSE_ID", "wh-test")
+        monkeypatch.setattr(auth, "get_service_principal_client", lambda: MagicMock())
+        monkeypatch.setattr(
+            auth, "get_home_service_principal_client", lambda: MagicMock(), raising=False,
+        )
+
+        def _query(_ws, _wh, sql):
+            assert "genie_opt_runs" in sql
+            return pd.DataFrame([dict(r) for r in gso_runs])
+
+        monkeypatch.setattr(warehouse, "sql_warehouse_query", _query)
+
+    @staticmethod
     def _patch_common(monkeypatch, *, gso_runs, legacy_run=None):
         """Stub scan_space's external reads: config fetch, UC enrichment,
         legacy optimization_runs, GSO runs, and persistence."""
         import backend.services.scanner as scanner
-        import backend.services.gso_lakebase as gso_lakebase
         import backend.services.auth as auth
 
         # Minimal scorable config (1 table, no benchmarks needed for accuracy).
@@ -922,9 +941,7 @@ class TestScanSpaceGsoSelection:
             return legacy_run
         monkeypatch.setattr(scanner, "get_latest_optimization_run", _legacy)
 
-        async def _gso(_sid):
-            return list(gso_runs)
-        monkeypatch.setattr(gso_lakebase, "load_gso_runs_for_space", _gso)
+        TestScanSpaceGsoSelection._patch_gso_delta(monkeypatch, gso_runs)
 
         async def _save(_sid, _result):
             return None
@@ -975,7 +992,6 @@ class TestScanSpaceGsoSelection:
         """scan_space must score the API-level agent description, not only the
         parsed serialized_space payload."""
         import backend.services.scanner as scanner
-        import backend.services.gso_lakebase as gso_lakebase
         import backend.services.auth as auth
 
         def _get_serialized_space(_sid, *, include_top_level_description=False):
@@ -995,9 +1011,7 @@ class TestScanSpaceGsoSelection:
             return None
         monkeypatch.setattr(scanner, "get_latest_optimization_run", _legacy)
 
-        async def _gso(_sid):
-            return []
-        monkeypatch.setattr(gso_lakebase, "load_gso_runs_for_space", _gso)
+        TestScanSpaceGsoSelection._patch_gso_delta(monkeypatch, [])
 
         async def _save(_sid, _result):
             return None

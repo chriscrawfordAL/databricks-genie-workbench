@@ -100,7 +100,7 @@ def client(monkeypatch) -> TestClient:
         return set()
 
     monkeypatch.setattr(
-        auto_optimize.workbench_lakebase,
+        auto_optimize.workbench_state,
         "get_hidden_optimization_run_ids",
         no_hidden_runs,
     )
@@ -542,7 +542,7 @@ def test_hidden_latest_match_is_excluded_from_current_version(
         return {"r2"}
 
     monkeypatch.setattr(
-        auto_optimize.workbench_lakebase,
+        auto_optimize.workbench_state,
         "get_hidden_optimization_run_ids",
         hidden_runs,
     )

@@ -63,7 +63,7 @@ def _agent_with_session(monkeypatch, responses):
         config=SimpleNamespace(host="https://example.databricks.com/"),
         api_client=SimpleNamespace(_api_client=SimpleNamespace(_session=session)),
     )
-    monkeypatch.setattr(create_agent, "get_workspace_client", lambda: client)
+    monkeypatch.setattr(create_agent, "get_home_workspace_client", lambda: client)
     return create_agent.CreateGenieAgent(), session
 
 
@@ -190,13 +190,13 @@ _SCOPE_403 = "Invalid scope, required scopes: ai-gateway"
 
 def _scope_rig(monkeypatch, user_first, sp_responses=(), sp_is_user=False):
     agent, user_session = _agent_with_session(monkeypatch, [user_first])
-    user_client = create_agent.get_workspace_client()
+    user_client = create_agent.get_home_workspace_client()
     sp_session = _Session(list(sp_responses))
     sp_client = user_client if sp_is_user else SimpleNamespace(
         config=SimpleNamespace(host="https://example.databricks.com/"),
         api_client=SimpleNamespace(_api_client=SimpleNamespace(_session=sp_session)),
     )
-    monkeypatch.setattr(create_agent, "get_service_principal_client", lambda: sp_client)
+    monkeypatch.setattr(create_agent, "get_home_service_principal_client", lambda: sp_client)
     return agent, user_session, sp_session
 
 

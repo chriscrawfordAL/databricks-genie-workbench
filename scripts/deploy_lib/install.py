@@ -16,10 +16,9 @@ from .apps import (
     patch_app_resources,
     require_successful_deployment,
 )
-from .config import APP_NAME_ERROR, APP_NAME_RE, InstallConfig, InstallResult, LakebaseInfo
+from .config import APP_NAME_ERROR, APP_NAME_RE, InstallConfig, InstallResult
 from .genie_spaces import optionally_grant_genie_spaces
 from .gso_job import ensure_gso_job
-from .lakebase import ensure_lakebase, find_soft_deleted_project
 from .uc import ensure_uc_objects_and_grants
 from .verify import verify_ai_gateway, verify_app_deployment
 from .workspace_source import (
@@ -129,13 +128,6 @@ def describe_update_check(value: str) -> str:
     return "Daily release check: ASK (users will be asked on the Admin tab)."
 
 
-RECORDED_LAKEBASE_DELETED = (
-    "The Lakebase project '{project}' that app '{name}' uses is deleted (it can still be restored "
-    "for 7 days). Restore it with `databricks postgres undelete-project projects/{project}`, then "
-    "run the installer again."
-)
-
-
 def app_env(app_yaml_text: str | None) -> dict[str, str]:
     """Literal env values from a deployed app.yaml.
 
@@ -162,45 +154,19 @@ def app_env(app_yaml_text: str | None) -> dict[str, str]:
     return env
 
 
-def reuse_recorded_lakebase(
-    cfg: InstallConfig,
-    app: dict[str, Any] | None,
-    app_yaml_text: str | None,
-) -> InstallConfig:
-    """On a rerun, keep the Lakebase project the app already uses (spec 11.5, 11.9).
+def reuse_recorded_state_location(cfg: InstallConfig, app_yaml_text: str | None) -> InstallConfig:
+    """A rerun with a blank state_catalog keeps the location the app already uses.
 
-    lakebase_mode = create with a blank project name would otherwise target
-    <app_name>-lakebase: a new, empty project whenever the app was set up with a
-    different name (common for CLI installs or explicit names).
+    Rendering a blank would clear WORKBENCH_STATE_CATALOG and send the app back to its
+    Setup dialog, where an admin could point it at a different, empty state table.
     """
-    recorded = app_env(app_yaml_text).get("LAKEBASE_INSTANCE_NAME")
-    if app is not None and cfg.lakebase_mode == "create" and not (cfg.lakebase_instance or "").strip() and recorded:
-        return replace(cfg, lakebase_instance=recorded)
-    return cfg
-
-
-def _lakebase_project_state(w, project: str) -> str:
-    """"missing", "deleted" (soft-deleted, still restorable), or "ok"."""
-    from databricks.sdk.errors import NotFound
-
-    try:
-        found = w.postgres.get_project(name=f"projects/{project}")
-    except NotFound:
-        # A soft-deleted project can also 404 here; ensure_project finds it through
-        # list_projects(show_deleted=True) and purges it, so check the same way.
-        return "deleted" if find_soft_deleted_project(w, project) else "missing"
-    return "deleted" if getattr(found, "delete_time", None) else "ok"
-
-
-def require_reused_lakebase_not_deleted(w, cfg: InstallConfig) -> None:
-    """A rerun that reuses the app's recorded project must never purge it.
-
-    lakebase_mode = create purges a soft-deleted project of the same name before
-    recreating it. The admin never typed this name, so stop and point at the
-    restore command instead. A project that is fully gone is simply created again.
-    """
-    if cfg.lakebase_instance and _lakebase_project_state(w, cfg.lakebase_instance) == "deleted":
-        raise RuntimeError(RECORDED_LAKEBASE_DELETED.format(project=cfg.lakebase_instance, name=cfg.app_name))
+    if (cfg.state_catalog or "").strip():
+        return cfg
+    env = app_env(app_yaml_text)
+    recorded = env.get("WORKBENCH_STATE_CATALOG")
+    if not recorded:
+        return cfg
+    return replace(cfg, state_catalog=recorded, state_schema=env.get("WORKBENCH_STATE_SCHEMA") or cfg.state_schema)
 
 
 def notebook_build_commit(w, repo_root: str | None) -> str:
@@ -219,13 +185,17 @@ def notebook_build_commit(w, repo_root: str | None) -> str:
     return head[:12]
 
 
+def verification_state_location(uc_verification: dict[str, Any]) -> str | None:
+    state = uc_verification.get("state_schema") or {}
+    return state.get("state_location") or None
+
+
 def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
     status = status_fn or _default_status
     app_name = cfg.app_name.strip()
     if not APP_NAME_RE.match(app_name):
         raise ValueError(APP_NAME_ERROR)
-    # Fail fast on the values as typed, before any workspace call. The config is
-    # validated again below once a rerun has picked up the app's Lakebase project.
+    # Fail fast on the values as typed, before any workspace call.
     cfg.normalized().validate()
     preflight_deployment(Path(cfg.repo_root or ""))
 
@@ -234,18 +204,13 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
     status(f"Using deployer: {deployer_user}")
 
     # Read the existing app and its current app.yaml before anything is created or
-    # regenerated, so a rerun keeps the app's Lakebase project and release-check answer.
+    # regenerated, so a rerun keeps the app's release-check answer and build record.
     existing_app = get_app(w, app_name)
     app_existed = existing_app is not None
     prior_app_yaml = prior_app_yaml_text(w, existing_app, cfg.normalized(), deployer_user) if app_existed else None
-    typed_lakebase = (cfg.lakebase_instance or "").strip()
-    cfg = reuse_recorded_lakebase(cfg, existing_app, prior_app_yaml)
-    reused_lakebase = not typed_lakebase and bool(cfg.lakebase_instance)
+    cfg = reuse_recorded_state_location(cfg, prior_app_yaml)
     cfg = cfg.normalized()
     cfg.validate()
-    if reused_lakebase:
-        status(f"Keeping the Lakebase project this app already uses: {cfg.lakebase_instance}")
-        require_reused_lakebase_not_deleted(w, cfg)
 
     if cfg.llm_route == "gateway":
         status(f"Checking Unity AI Gateway with model {cfg.llm_model}...")
@@ -279,17 +244,6 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
     uc_verification = ensure_uc_objects_and_grants(w, cfg, app_sp_client_id)
     status("Unity Catalog objects and grants processed.")
 
-    lakebase: LakebaseInfo | None = None
-    if cfg.lakebase_mode != "skip" and cfg.lakebase_instance:
-        status(f"Provisioning Lakebase project '{cfg.lakebase_instance}'...")
-        lakebase = ensure_lakebase(w, cfg, app_sp_client_id)
-        status(
-            "Lakebase processed "
-            f"(database={lakebase.database_resource or 'unresolved'}, grants={lakebase.grants_applied})."
-        )
-    else:
-        status("Skipping Lakebase provisioning.")
-
     status("Uploading GSO job notebooks, building wheel, and creating/updating job...")
     gso_job = ensure_gso_job(w, cfg, app_sp_client_id, deployer_user)
     status(f"GSO job ready: {gso_job.job_id}")
@@ -319,7 +273,10 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
             "WAREHOUSE_ID": cfg.warehouse_id,
             "GSO_CATALOG": cfg.catalog,
             "GSO_JOB_ID": str(gso_job.job_id),
-            "LAKEBASE_INSTANCE": cfg.lakebase_instance or "",
+            # Workbench state location: blank = an admin picks it in the app's Setup dialog.
+            "WORKBENCH_STATE_CATALOG": cfg.state_catalog or "",
+            "WORKBENCH_STATE_SCHEMA": cfg.state_schema or "",
+            "WORKSPACES_SECRET_SCOPE": cfg.workspaces_secret_scope,
             "LLM_MODEL": cfg.llm_model,
             **llm_route_replacements(cfg),
             "MLFLOW_EXPERIMENT_ID": cfg.mlflow_experiment_id or "",
@@ -338,7 +295,7 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
     )
 
     status("Configuring app scopes and resources...")
-    resources_payload = patch_app_resources(w, cfg, lakebase)
+    resources_payload = patch_app_resources(w, cfg)
     status("Triggering Databricks App deployment and waiting for success...")
     submitted_deployment = deploy_app_from_workspace(w, cfg.app_name, source_path)
     deployed_app = {"pending_deployment": submitted_deployment}
@@ -359,7 +316,7 @@ def run_install(w, cfg: InstallConfig, status_fn=None) -> dict[str, Any]:
         source_path=source_path,
         service_principal_client_id=app_sp_client_id,
         gso_job=gso_job,
-        lakebase=lakebase,
+        state_location=verification_state_location(uc_verification),
         genie_spaces_granted=genie_spaces_granted,
         deployment=deployment or {},
         verification=verification,

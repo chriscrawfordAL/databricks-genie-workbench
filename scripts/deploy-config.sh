@@ -14,13 +14,16 @@
 #   GENIE_LLM_MODEL          (optional)  Default LLM serving endpoint [default: databricks-claude-sonnet-4-6]
 #   GENIE_LLM_ROUTE          (optional)  gateway | classic            [default: gateway]
 #   GENIE_BYOK_ENABLED       (optional)  true | false (gateway only)  [default: false]
-#   GENIE_LAKEBASE_INSTANCE  (optional)  Lakebase instance name       [default: none]
+#   GENIE_STATE_CATALOG      (optional)  Catalog for the app's Delta state tables [default: chosen in the app's Setup dialog]
+#   GENIE_STATE_SCHEMA       (optional)  Schema for the app's Delta state tables  [default: genie_workbench_state]
+#   GENIE_WORKSPACES_SECRET_SCOPE (optional) Secret scope for cross-workspace SP secrets [default: genie-workbench-workspaces]
 #   GENIE_MLFLOW_EXPERIMENT_ID (optional) MLflow experiment ID for agent tracing [default: disabled]
 #   GENIE_UPDATE_CHECK       (optional)  true | false | empty (ask users on the Admin tab) [default: empty]
 #
 # After sourcing, the following variables are available:
 #   APP_NAME, CATALOG, GSO_SCHEMA, WAREHOUSE_ID, PROFILE, LLM_MODEL, LLM_ROUTE,
-#   BYOK_ENABLED, MLFLOW_EXPERIMENT_ID, UPDATE_CHECK
+#   BYOK_ENABLED, MLFLOW_EXPERIMENT_ID, UPDATE_CHECK, STATE_CATALOG, STATE_SCHEMA,
+#   WORKSPACES_SECRET_SCOPE
 # ---------------------------------------------------------------------------
 
 # ── Load .env.deploy if present (in project root) ─────────────────────────
@@ -42,7 +45,13 @@ PROFILE="${GENIE_DEPLOY_PROFILE:-DEFAULT}"
 LLM_MODEL="${GENIE_LLM_MODEL:-databricks-claude-sonnet-4-6}"
 LLM_ROUTE="$(echo "${GENIE_LLM_ROUTE:-gateway}" | tr '[:upper:]' '[:lower:]')"
 BYOK_ENABLED="$(echo "${GENIE_BYOK_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
-LAKEBASE_INSTANCE="${GENIE_LAKEBASE_INSTANCE:-}"
+STATE_CATALOG="${GENIE_STATE_CATALOG:-}"
+STATE_SCHEMA="${GENIE_STATE_SCHEMA:-genie_workbench_state}"
+if [ -z "$STATE_CATALOG" ]; then STATE_SCHEMA=""; fi
+WORKSPACES_SECRET_SCOPE="${GENIE_WORKSPACES_SECRET_SCOPE:-genie-workbench-workspaces}"
+if [ -n "${GENIE_LAKEBASE_INSTANCE:-}" ]; then
+    echo "WARNING: GENIE_LAKEBASE_INSTANCE is ignored — this build stores app state in Delta tables, not Lakebase." >&2
+fi
 MLFLOW_EXPERIMENT_ID="${GENIE_MLFLOW_EXPERIMENT_ID:-}"
 UPDATE_CHECK_RAW="${GENIE_UPDATE_CHECK:-}"
 case "$(echo "$UPDATE_CHECK_RAW" | tr '[:upper:]' '[:lower:]')" in
@@ -95,7 +104,11 @@ _print_config() {
     echo "  │  Warehouse ID: $WAREHOUSE_ID"
     echo "  │  Default LLM:  $LLM_MODEL"
     echo "  │  LLM route:    $LLM_ROUTE (BYOK: $BYOK_ENABLED)"
-    echo "  │  Lakebase:     $LAKEBASE_INSTANCE"
+    if [ -n "$STATE_CATALOG" ]; then
+        echo "  │  App state:    $STATE_CATALOG.$STATE_SCHEMA (Delta)"
+    else
+        echo "  │  App state:    Delta (location chosen in the app Setup dialog)"
+    fi
     echo "  │  MLflow:       ${MLFLOW_EXPERIMENT_ID:-<disabled>}"
     echo "  │  Release check: ${UPDATE_CHECK:-ask users on the Admin tab}"
     echo "  └─────────────────────────────────────────────────────────┘"

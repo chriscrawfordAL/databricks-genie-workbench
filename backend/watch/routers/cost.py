@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Query
 
-from backend.services import lakebase
+from backend.services import state_store
 from backend.watch._validators import validate_days, validate_space_id
 from backend.watch.models import (
     CostPerConversation,
@@ -107,7 +107,7 @@ async def top_spenders(days: int = Query(7, ge=1, le=365), limit: int = Query(10
     # entry just leaves title=None and the UI falls back to the space id.
     titles: dict[str, str] = {}
     try:
-        for s in await lakebase.watch_list_cached_spaces():
+        for s in await state_store.watch_list_cached_spaces():
             sid, title = s.get("space_id"), s.get("title")
             if sid and title:
                 titles[sid] = title

@@ -62,7 +62,7 @@ def test_permission_population_reuses_cache_and_preserves_it_on_forced_failure(m
     async def list_cached():
         return [{"space_id": "one", "permissions": cached}]
 
-    monkeypatch.setattr(spaces.lakebase, "watch_list_cached_spaces", list_cached)
+    monkeypatch.setattr(spaces.state_store, "watch_list_cached_spaces", list_cached)
     calls = []
 
     def fetch(space_id):
@@ -84,7 +84,7 @@ def test_permission_population_failure_without_cache_is_empty(monkeypatch):
     async def list_cached():
         return []
 
-    monkeypatch.setattr(spaces.lakebase, "watch_list_cached_spaces", list_cached)
+    monkeypatch.setattr(spaces.state_store, "watch_list_cached_spaces", list_cached)
     monkeypatch.setattr(
         spaces.genie_client, "list_space_permissions", lambda _: (_ for _ in ()).throw(RuntimeError("denied")),
     )
@@ -113,7 +113,7 @@ def test_permission_population_limits_concurrency_to_eight(monkeypatch):
             active -= 1
         return {"access_control_list": []}
 
-    monkeypatch.setattr(spaces.lakebase, "watch_list_cached_spaces", list_cached)
+    monkeypatch.setattr(spaces.state_store, "watch_list_cached_spaces", list_cached)
     monkeypatch.setattr(spaces.genie_client, "list_space_permissions", fetch)
     summaries = [{"space_id": str(i), "permissions": []} for i in range(20)]
     asyncio.run(spaces._populate_permissions(summaries))
@@ -135,7 +135,7 @@ def test_permission_population_isolates_per_agent_failures(monkeypatch):
             "all_permissions": [{"permission_level": "CAN_MANAGE", "inherited": True}],
         }]}
 
-    monkeypatch.setattr(spaces.lakebase, "watch_list_cached_spaces", list_cached)
+    monkeypatch.setattr(spaces.state_store, "watch_list_cached_spaces", list_cached)
     monkeypatch.setattr(spaces.genie_client, "list_space_permissions", fetch)
     summaries = [
         {"space_id": "succeeds", "permissions": []},

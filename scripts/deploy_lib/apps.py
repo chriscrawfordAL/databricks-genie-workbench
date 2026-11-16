@@ -7,7 +7,7 @@ import time
 from datetime import timedelta
 from typing import Any
 
-from .config import InstallConfig, LakebaseInfo
+from .config import InstallConfig
 
 
 APP_SCOPES = [
@@ -152,19 +152,20 @@ def _resource_has_config(resource: dict[str, Any]) -> bool:
     return any(key for key in resource if key != "name")
 
 
-def patch_app_resources(
-    w,
-    cfg: InstallConfig,
-    lakebase: LakebaseInfo | None,
-) -> dict[str, Any]:
+def _is_lakebase_resource(resource: dict[str, Any]) -> bool:
+    """A 'postgres' (Lakebase) resource from an older install. State is in Delta now."""
+    return resource.get("name") == "postgres" or "postgres" in resource or "database" in resource
+
+
+def patch_app_resources(w, cfg: InstallConfig) -> dict[str, Any]:
     app = get_app(w, cfg.app_name) or {}
     by_name: dict[str, dict[str, Any]] = {}
 
     for resource in app.get("resources") or []:
         name = resource.get("name")
-        if not name:
+        if not name or _is_lakebase_resource(resource):
             continue
-        if _resource_has_config(resource) or name in {"sql-warehouse", "postgres"}:
+        if _resource_has_config(resource) or name == "sql-warehouse":
             by_name[name] = resource
 
     by_name["sql-warehouse"] = {
@@ -174,16 +175,6 @@ def patch_app_resources(
             "permission": "CAN_USE",
         },
     }
-
-    if lakebase and lakebase.database_resource:
-        by_name["postgres"] = {
-            "name": "postgres",
-            "postgres": {
-                "branch": lakebase.branch_resource,
-                "database": lakebase.database_resource,
-                "permission": "CAN_CONNECT_AND_CREATE",
-            },
-        }
 
     payload = {
         "user_api_scopes": APP_SCOPES,

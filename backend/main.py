@@ -3,7 +3,7 @@ Genie Workbench - Main entry point.
 
 Unified Databricks Genie Agent management platform combining:
 - GenieRx: Deep LLM analysis, optimization suggestions
-- GenieIQ: Org-wide IQ scoring, Lakebase persistence, admin dashboard
+- GenieIQ: Org-wide IQ scoring, Delta-table persistence, admin dashboard
 """
 
 import asyncio
@@ -60,13 +60,19 @@ _mlflow_configured = _validate_mlflow_experiment()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 from backend.app_version import read_version
-from backend.services.auth import is_running_on_databricks_apps, set_obo_user_token, clear_obo_user_token
+from backend.services.auth import (
+    clear_obo_user_token,
+    clear_target_workspace,
+    is_running_on_databricks_apps,
+    set_obo_user_token,
+    set_target_workspace,
+)
 from backend.routers.analysis import router as analysis_router
 from backend.routers.spaces import router as spaces_router
 from backend.routers.admin import router as admin_router
@@ -74,6 +80,9 @@ from backend.routers.app_info import router as app_info_router
 from backend.routers.auth import router as auth_router
 from backend.routers.create import router as create_router
 from backend.routers.auto_optimize import router as auto_optimize_router
+from backend.routers.setup import router as setup_router
+from backend.routers.transfer import router as transfer_router
+from backend.routers.workspaces import router as workspaces_router
 from backend.watch.routers import (
     watch_admin_router,
     watch_cost_router,
@@ -105,6 +114,7 @@ class OBOAuthMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:
+        request.state.target_workspace_id = ""
         if request.url.path.startswith("/api/"):
             token = request.headers.get("x-forwarded-access-token", "")
             if token:
@@ -129,6 +139,11 @@ class OBOAuthMiddleware(BaseHTTPMiddleware):
                     dev_email=os.environ.get("DEV_USER_EMAIL"))
                 if vc_auth is not None:
                     request.state.vc_auth = vc_auth
+
+            rejection = await _apply_target_workspace(request)
+            if rejection is not None:
+                clear_obo_user_token()
+                return rejection
         else:
             request.state.user_token = ""
 
@@ -137,7 +152,66 @@ class OBOAuthMiddleware(BaseHTTPMiddleware):
         is_streaming = getattr(response, "media_type", "") == "text/event-stream"
         if not is_streaming:
             clear_obo_user_token()
+            clear_target_workspace()
         return response
+
+
+# API prefixes that always run against the HOME workspace, whatever the caller
+# selected: connection management + storage setup (home secrets/state), the
+# caller's identity, app info, and Version Control (bound to the home
+# workspace's control plane). Auto-Optimize keeps its data plane (GSO Delta
+# tables, MLflow, the optimizer job) at home and opts into the remote agent
+# client explicitly for Genie-Agent operations (see routers/auto_optimize.py).
+_HOME_ONLY_PREFIXES = (
+    "/api/workspaces",
+    "/api/setup",
+    "/api/transfer",
+    "/api/auth",
+    "/api/admin/version",
+    "/api/admin/update-check",
+    "/api/version-control",
+    "/api/auto-optimize",
+)
+
+
+async def _apply_target_workspace(request: Request) -> Response | None:
+    """Resolve ``X-Target-Workspace`` into a remote client for this request.
+
+    Remote calls run as a service principal in the remote workspace (there is no
+    per-user identity there), so targeting is restricted to home-workspace
+    admins. A target that cannot be resolved is an error — never a silent
+    fallback to home, which would show home data under a remote label.
+    """
+    conn_id = request.headers.get("x-target-workspace", "").strip()
+    path = request.url.path
+    if not conn_id or path.startswith(_HOME_ONLY_PREFIXES):
+        return None
+    from backend.services.auth import is_admin_request
+
+    if not is_admin_request(request):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Only workspace admins can work in other workspaces."},
+        )
+    try:
+        from backend.services import workspaces as ws_service
+
+        client = await ws_service.get_client_for_workspace(conn_id)
+        conn = await ws_service.get_connection(conn_id) if client is not None else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not connect to target workspace %s", conn_id, exc_info=True)
+        return JSONResponse(
+            status_code=502,
+            content={"detail": f"Could not connect to the selected workspace: {str(e)[:200]}"},
+        )
+    if client is None:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "The selected workspace is no longer registered. Switch back to the home workspace."},
+        )
+    set_target_workspace(conn_id, client, (conn or {}).get("warehouse_id"))
+    request.state.target_workspace_id = conn_id
+    return None
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -155,10 +229,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    from backend.services.lakebase import init_pool
-    await init_pool()
-    from backend.services.create_agent_session import _ensure_table
-    await _ensure_table()
+    # Delta state store: resolve the storage location and load state in the
+    # background — a cold SQL warehouse can take minutes and must not stall the
+    # Apps healthcheck. Reads serve from memory until the load completes.
+    from backend.services import state_store
+    state_init_task = asyncio.create_task(state_store.init())
     _ensure_gso_job_run_as()
     try:
         # Bug #2 schema probe — synchronous Delta SELECT (a few seconds worst
@@ -173,11 +248,19 @@ async def lifespan(app: FastAPI):
     # takes a long time to run.
     asyncio.create_task(asyncio.to_thread(warm_cost_overview_cache, 7))
 
+    # Periodically hand buffered cross-workspace transfer counters to the store.
+    from backend.services import transfer_meter
+    transfer_task = asyncio.create_task(transfer_meter.flush_periodically(30))
+
     yield
 
-    # Shutdown
-    from backend.services.lakebase import close_pool
-    await close_pool()
+    transfer_task.cancel()
+    await transfer_meter.flush()
+
+    # Shutdown: flush pending state writes to Delta.
+    if not state_init_task.done():
+        state_init_task.cancel()
+    await state_store.close()
 
 
 app = FastAPI(
@@ -221,7 +304,6 @@ if not is_running_on_databricks_apps():
         allow_headers=["Content-Type", "Authorization"],
     )
 
-# Lakebase connection pool lifecycle
 def _ensure_gso_job_run_as() -> None:
     """Ensure the GSO optimization job's run_as matches this app's SP.
 
@@ -233,10 +315,10 @@ def _ensure_gso_job_run_as() -> None:
     if not job_id_str.isdigit():
         return
     try:
-        from backend.services.auth import get_service_principal_client
+        from backend.services.auth import get_home_service_principal_client
         from genie_space_optimizer.backend.job_launcher import ensure_job_run_as
 
-        ws = get_service_principal_client()
+        ws = get_home_service_principal_client()
         sp_client_id = ws.config.client_id or os.environ.get("DATABRICKS_CLIENT_ID", "")
         if sp_client_id:
             ensure_job_run_as(ws, int(job_id_str), sp_client_id)
@@ -252,6 +334,9 @@ app.include_router(app_info_router)
 app.include_router(auth_router)
 app.include_router(create_router)
 app.include_router(auto_optimize_router)
+app.include_router(setup_router)
+app.include_router(workspaces_router)
+app.include_router(transfer_router)
 
 # GenieWatch (observability) — all routes under /api/watch/*
 app.include_router(watch_spaces_router)

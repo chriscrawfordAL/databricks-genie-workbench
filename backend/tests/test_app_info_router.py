@@ -12,7 +12,7 @@ NON_ADMIN = {"X-Forwarded-Groups": "users", "X-Forwarded-Email": "user@example.c
 
 @pytest.fixture
 def store(monkeypatch):
-    """A fake Lakebase settings store (available by default)."""
+    """A fake Workbench state-store settings backend (available by default)."""
     state = {"available": True, "rows": {}, "read_error": None, "write_error": None, "writes": []}
 
     async def get_app_setting(key):
@@ -29,10 +29,10 @@ def store(monkeypatch):
         state["writes"].append((key, value, updated_by))
         return True
 
-    monkeypatch.setattr(app_info.lakebase, "get_app_setting", get_app_setting)
-    monkeypatch.setattr(app_info.lakebase, "set_app_setting", set_app_setting)
-    monkeypatch.setattr(app_info.lakebase, "is_available", lambda: state["available"])
-    monkeypatch.setattr(app_info.lakebase, "is_configured", lambda: state.get("configured", state["available"]))
+    monkeypatch.setattr(app_info.state_store, "get_app_setting", get_app_setting)
+    monkeypatch.setattr(app_info.state_store, "set_app_setting", set_app_setting)
+    monkeypatch.setattr(app_info.state_store, "is_available", lambda: state["available"])
+    monkeypatch.setattr(app_info.state_store, "is_configured", lambda: state.get("configured", state["available"]))
     for name in ("UPDATE_CHECK_ENABLED", "DEV_ADMIN", "DEV_USER_EMAIL", "GWB_BUILD_COMMIT", "GWB_DEPLOYED_AT", "GWB_INSTALL_METHOD"):
         monkeypatch.delenv(name, raising=False)
     return state
@@ -78,7 +78,7 @@ def test_update_check_resolution(client, store, monkeypatch, install_env, availa
     assert (uc["mode"], uc["source"], uc["locked"], uc["persisted"]) == expected
 
 
-def test_a_lakebase_read_error_fails_closed_without_leaking(client, store, caplog):
+def test_a_storage_read_error_fails_closed_without_leaking(client, store, caplog):
     store["read_error"] = RuntimeError("password zq_secret")
     response = client.get("/api/admin/version")
     uc = response.json()["update_check"]
@@ -115,7 +115,7 @@ def test_an_admin_answer_is_stored_app_wide(client, store):
     assert (uc["mode"], uc["source"]) == ("on", "app")
 
 
-def test_without_lakebase_the_answer_is_not_persisted(client, store):
+def test_without_durable_storage_the_answer_is_not_persisted(client, store):
     store["available"] = False
     response = client.put("/api/admin/update-check", json={"enabled": False}, headers=ADMIN)
     assert response.json() == {"mode": "off", "source": "app", "locked": False, "persisted": False}
@@ -130,16 +130,16 @@ def test_a_save_failure_is_a_503_without_leaking(client, store, caplog):
     assert "zq_secret" not in response.text and "zq_secret" not in caplog.text
 
 
-# Review finding #2: Lakebase configured (LAKEBASE_HOST set) but the pool never came up
+# Review finding #2: storage configured (a location is set) but it never came up
 # must fail closed, not fall back to "ask" / browser-local answers.
-def test_configured_but_unavailable_lakebase_fails_closed(client, store):
+def test_configured_but_unavailable_storage_fails_closed(client, store):
     store["available"] = False
     store["configured"] = True
     uc = client.get("/api/admin/version").json()["update_check"]
     assert (uc["mode"], uc["source"], uc["locked"], uc["persisted"]) == ("off", "error", False, False)
 
 
-def test_saving_while_configured_lakebase_is_down_is_a_503(client, store):
+def test_saving_while_configured_storage_is_down_is_a_503(client, store):
     store["available"] = False
     store["configured"] = True
     response = client.put("/api/admin/update-check", json={"enabled": True}, headers=ADMIN)

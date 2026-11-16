@@ -57,9 +57,49 @@ import type {
   JoinCandidatesResponse,
   JoinAdviceResponse,
   SpaceAccess,
+  WorkspaceConnection,
+  WorkspaceConnectionCreate,
+  WorkspaceConnectionUpdate,
+  WorkspacesInfo,
+  WorkspaceTestResult,
+  TransferSummary,
+  StorageStatus,
+  UcNamed,
 } from "@/types"
 
 const API_BASE = "/api"
+
+// ── Cross-workspace targeting ──
+// The selected remote workspace (connection id) lives in a module-level
+// singleton so the non-React fetch helpers can attach it as a header without
+// every call site threading it through; the WorkspaceProvider keeps it in sync.
+// null means the home workspace (where the app is deployed). It is read from
+// localStorage at module load so the very first request after a page load
+// already carries the persisted target, before the provider's effects run.
+export const WORKSPACE_STORAGE_KEY = "genie-workbench-target-workspace"
+let _activeWorkspaceId: string | null = (() => {
+  try {
+    return localStorage.getItem(WORKSPACE_STORAGE_KEY) || null
+  } catch {
+    return null
+  }
+})()
+
+export function setActiveWorkspaceId(workspaceId: string | null): void {
+  _activeWorkspaceId = workspaceId || null
+}
+
+export function getActiveWorkspaceId(): string | null {
+  return _activeWorkspaceId
+}
+
+/** Merge the target-workspace header into request headers when one is selected. */
+export function withWorkspaceHeaders(headers: HeadersInit = {}): HeadersInit {
+  if (!_activeWorkspaceId) return headers
+  const merged = new Headers(headers)
+  merged.set("X-Target-Workspace", _activeWorkspaceId)
+  return merged
+}
 
 // Request timeout values (in milliseconds)
 const DEFAULT_TIMEOUT = 30_000 // 30 seconds for most requests
@@ -143,6 +183,7 @@ async function fetchWithTimeout<T>(
   try {
     const response = await fetch(url, {
       ...options,
+      headers: withWorkspaceHeaders(options.headers),
       signal: controller.signal,
     })
 
@@ -291,6 +332,83 @@ export async function getCurrentUser(): Promise<CurrentUser> {
   return fetchWithTimeout<CurrentUser>(`${API_BASE}/auth/me`, {}, DEFAULT_TIMEOUT)
 }
 
+// ── Cross-workspace connections ──────────────────────────────────────────────
+
+export async function listWorkspaces(): Promise<WorkspaceConnection[]> {
+  return fetchWithTimeout<WorkspaceConnection[]>(`${API_BASE}/workspaces`, {}, DEFAULT_TIMEOUT)
+}
+
+export async function getWorkspacesInfo(): Promise<WorkspacesInfo> {
+  return fetchWithTimeout<WorkspacesInfo>(`${API_BASE}/workspaces/info`, {}, DEFAULT_TIMEOUT)
+}
+
+export async function createWorkspace(payload: WorkspaceConnectionCreate): Promise<WorkspaceConnection> {
+  return fetchWithTimeout<WorkspaceConnection>(`${API_BASE}/workspaces`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, LONG_TIMEOUT)
+}
+
+export async function updateWorkspace(
+  workspaceId: string,
+  payload: WorkspaceConnectionUpdate,
+): Promise<WorkspaceConnection> {
+  return fetchWithTimeout<WorkspaceConnection>(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, LONG_TIMEOUT)
+}
+
+export async function deleteWorkspace(workspaceId: string): Promise<void> {
+  await fetchWithTimeout(`${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}`, { method: "DELETE" }, DEFAULT_TIMEOUT)
+}
+
+export async function testWorkspace(workspaceId: string): Promise<WorkspaceTestResult> {
+  return fetchWithTimeout<WorkspaceTestResult>(
+    `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/test`,
+    { method: "POST", headers: { "Content-Type": "application/json" } },
+    LONG_TIMEOUT,
+  )
+}
+
+// ── Data-transfer observability ──────────────────────────────────────────────
+
+export async function getTransferSummary(days = 30): Promise<TransferSummary> {
+  return fetchWithTimeout<TransferSummary>(`${API_BASE}/transfer/summary?days=${days}`, {}, DEFAULT_TIMEOUT)
+}
+
+// ── Workbench storage setup (Delta state location) ───────────────────────────
+
+export async function getStorageStatus(): Promise<StorageStatus> {
+  return fetchWithTimeout<StorageStatus>(`${API_BASE}/setup/status`, {}, DEFAULT_TIMEOUT)
+}
+
+export async function listSetupCatalogs(): Promise<UcNamed[]> {
+  return fetchWithTimeout<UcNamed[]>(`${API_BASE}/setup/catalogs`, {}, LONG_TIMEOUT)
+}
+
+export async function listSetupSchemas(catalog: string): Promise<UcNamed[]> {
+  return fetchWithTimeout<UcNamed[]>(
+    `${API_BASE}/setup/schemas?catalog=${encodeURIComponent(catalog)}`,
+    {},
+    LONG_TIMEOUT,
+  )
+}
+
+export async function configureStorage(payload: {
+  catalog: string
+  schema: string
+  create_schema: boolean
+}): Promise<StorageStatus> {
+  return fetchWithTimeout<StorageStatus>(`${API_BASE}/setup/configure`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }, LONG_TIMEOUT)
+}
+
 export async function getAppVersion(): Promise<AppVersionInfo> {
   return fetchWithTimeout<AppVersionInfo>(`${API_BASE}/admin/version`, {}, DEFAULT_TIMEOUT)
 }
@@ -404,7 +522,7 @@ export function streamAgentChat(
 
   fetch(`${API_BASE}/create/agent/chat`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: withWorkspaceHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
     signal: abortController.signal,
   })
@@ -565,7 +683,7 @@ export function streamSpaceMvSuggest(
 
   fetch(`${API_BASE}/auto-optimize/spaces/${spaceId}/mv/suggest/stream`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: withWorkspaceHeaders({ "Content-Type": "application/json" }),
     signal: abortController.signal,
   })
     .then(async (response) => {

@@ -23,8 +23,6 @@ anyio==4.13.0
     #   openai
     #   starlette
     #   watchfiles
-asyncpg==0.31.0
-    # via genie-workbench
 attrs==26.1.0
     # via
     #   aiohttp

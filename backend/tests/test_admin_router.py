@@ -58,7 +58,7 @@ def test_a_summary_failure_is_a_500_with_no_exception_text(monkeypatch, caplog, 
     client, _ = _client(monkeypatch, spaces=[{"space_id": "s1"}])
 
     async def failing():
-        raise RuntimeError("lakebase zq_secret")
+        raise RuntimeError("storage zq_secret")
 
     monkeypatch.setattr(admin, "get_all_scan_summaries", failing)
     response = client.get(path)

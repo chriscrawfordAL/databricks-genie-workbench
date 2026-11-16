@@ -47,6 +47,8 @@ TASKS = [
             "benchmark_repair_max_tries", "triggered_by",
             "benchmark_policy", "warehouse_id", "workload_warehouse_ids", "llm_model",
             "genie_llm_route",
+            # Cross-workspace agent descriptor (secret-free JSON; "" = home agent).
+            "target",
         ],
     ),
     (
@@ -57,6 +59,8 @@ TASKS = [
             "run_id", "space_id", "domain", "catalog", "schema", "apply_mode",
             "benchmark_repair_max_tries", "warehouse_id", "llm_model",
             "genie_llm_route",
+            # Cross-workspace agent descriptor (secret-free JSON; "" = home agent).
+            "target",
             "benchmark_policy",
         ],
     ),
@@ -69,6 +73,8 @@ TASKS = [
             "levers", "max_attempts", "target_accuracy",
             "benchmark_policy", "warehouse_id", "llm_model",
             "genie_llm_route",
+            # Cross-workspace agent descriptor (secret-free JSON; "" = home agent).
+            "target",
             # Metric view advisor phase inputs (MV-D5). Present as base_parameters
             # so run_optimize.py's widgets receive real job values — a job
             # parameter omitted here silently resolves to the widget default.
@@ -84,6 +90,8 @@ TASKS = [
             "run_id", "space_id", "domain", "catalog", "schema", "apply_mode",
             "target_accuracy", "max_attempts", "warehouse_id", "llm_model",
             "genie_llm_route",
+            # Cross-workspace agent descriptor (secret-free JSON; "" = home agent).
+            "target",
             "benchmark_policy",
         ],
     ),
@@ -120,6 +128,10 @@ JOB_PARAMETERS = {
     "mv_attach_views": "",
     "mv_consent_id": "",
     "mv_min_confidence": "75",
+    # Cross-workspace: JSON descriptor of a remote agent (connection id, host,
+    # dedicated SP client id + home secret-scope reference, remote warehouse).
+    # "" means the agent is in this (home) workspace.
+    "target": "",
 }
 
 

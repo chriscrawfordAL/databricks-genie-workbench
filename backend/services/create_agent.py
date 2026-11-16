@@ -14,7 +14,7 @@ from typing import AsyncGenerator, Callable, Generator
 
 from backend.models import MAX_DESCRIPTION_CHARS
 from backend.services.llm_utils import get_llm_model, is_gateway_scope_403, normalize_message_content
-from backend.services.auth import get_service_principal_client, get_workspace_client, run_in_context
+from backend.services.auth import get_home_service_principal_client, get_home_workspace_client, run_in_context
 from backend.services.create_agent_session import AgentSession
 from backend.services.create_agent_tools import TOOL_DEFINITIONS, handle_tool_call, _present_plan
 from backend.services import plan_builder
@@ -1129,7 +1129,8 @@ class CreateGenieAgent:
         Retries automatically on 429 (rate limit) and 502/503 (transient)
         with exponential backoff.
         """
-        client = get_workspace_client()
+        # LLM inference always runs in the home workspace (cross-workspace safe).
+        client = get_home_workspace_client()
         host = (client.config.host or "").rstrip("/")
 
         body = {
@@ -1187,7 +1188,7 @@ class CreateGenieAgent:
             and resp.status_code == 403
             and is_gateway_scope_403(resp.status_code, resp.text)
         ):
-            sp_client = get_service_principal_client()
+            sp_client = get_home_service_principal_client()
             if sp_client is not client:
                 resp.close()
                 logger.warning(

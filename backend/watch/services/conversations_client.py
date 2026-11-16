@@ -1,8 +1,8 @@
 """Genie conversation enumeration with caching.
 
 Always runs as the service principal so a single sync covers every space
-regardless of which user is browsing the app. Persists into the shared
-workbench Lakebase under the `genie.watch_*` tables.
+regardless of which user is browsing the app. Persists into the Workbench Delta
+state store (``watch_*`` stores).
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from backend.services import lakebase
+from backend.services import state_store
 from backend.services.auth import get_service_principal_client
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ async def sync_space(space_id: str, fetch_messages: bool = True) -> dict[str, in
         conversations = _list_conversations(space_id)
     except Exception as e:
         logger.warning("conversation list failed for %s: %s", space_id, e)
-        await lakebase.watch_set_watermark(resource_key, status="error", error=str(e))
+        await state_store.watch_set_watermark(resource_key, status="error", error=str(e))
         return {"conversations": 0, "messages": 0, "error": str(e)}
 
     n_msgs = 0
@@ -90,7 +90,7 @@ async def sync_space(space_id: str, fetch_messages: bool = True) -> dict[str, in
                 created = m.get("created_timestamp") or m.get("created_at")
                 if created and (last_msg_at is None or str(created) > str(last_msg_at)):
                     last_msg_at = created
-                await lakebase.watch_upsert_message({
+                await state_store.watch_upsert_message({
                     "space_id": space_id,
                     "conversation_id": cid,
                     "message_id": m.get("id") or m.get("message_id") or "",
@@ -102,7 +102,7 @@ async def sync_space(space_id: str, fetch_messages: bool = True) -> dict[str, in
                 })
                 n_msgs += 1
 
-        await lakebase.watch_upsert_conversation({
+        await state_store.watch_upsert_conversation({
             "space_id": space_id,
             "conversation_id": cid,
             "user_email": (c.get("user") or {}).get("user_name"),
@@ -112,7 +112,7 @@ async def sync_space(space_id: str, fetch_messages: bool = True) -> dict[str, in
                                    or c.get("updated_at")),
         })
 
-    await lakebase.watch_set_watermark(resource_key, status="ok")
+    await state_store.watch_set_watermark(resource_key, status="ok")
     return {"conversations": len(conversations), "messages": n_msgs}
 
 

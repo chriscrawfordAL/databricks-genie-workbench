@@ -5,7 +5,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from backend.services.lakebase import get_all_scan_summaries
+from backend.services.state_store import get_all_scan_summaries
 from backend.services.genie_client import list_genie_spaces
 from backend.models import AdminDashboardStats, LeaderboardEntry, AlertItem
 from genie_space_optimizer.iq_scan.scoring import viewer_safe_text
@@ -37,7 +37,7 @@ async def get_dashboard() -> AdminDashboardStats:
         all_spaces = await _list_visible_spaces()
         total_spaces = len(all_spaces)
 
-        # Get all scan summaries from Lakebase
+        # Get all scan summaries from the Workbench state store
         scan_summaries = await get_all_scan_summaries()
         valid_ids = {s.get("space_id", "") for s in all_spaces}
         scan_summaries = [s for s in scan_summaries if s["space_id"] in valid_ids]

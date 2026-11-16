@@ -9,7 +9,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from backend.services import lakebase
+from backend.services import state_store
 from backend.watch._validators import validate_days, validate_space_id
 from backend.watch.models import (
     WatchSpaceListItem,
@@ -77,7 +77,7 @@ def _to_summary(raw: dict, permissions: Optional[list[dict]] = None) -> dict:
 async def _populate_permissions(summaries: list[dict], *, force: bool = False) -> None:
     cached = {
         s["space_id"]: s.get("permissions") or []
-        for s in await lakebase.watch_list_cached_spaces()
+        for s in await state_store.watch_list_cached_spaces()
     }
     semaphore = asyncio.Semaphore(8)
 
@@ -112,7 +112,7 @@ async def _refresh_cache_with_live_listing(*, force_permissions: bool = False) -
         summaries.append(summary)
     await _populate_permissions(summaries, force=force_permissions)
     for summary in summaries:
-        await lakebase.watch_upsert_space(summary)
+        await state_store.watch_upsert_space(summary)
     return summaries
 
 
@@ -122,7 +122,7 @@ async def list_spaces(days: int = Query(7, ge=1, le=365)) -> list[dict]:
     try:
         live = genie_client.list_genie_spaces()
     except Exception as e:
-        logger.warning("live list_genie_spaces failed (%s) — falling back to Lakebase cache", e)
+        logger.warning("live list_genie_spaces failed (%s) — falling back to the cached list", e)
         live = []
 
     if live:
@@ -134,9 +134,9 @@ async def list_spaces(days: int = Query(7, ge=1, le=365)) -> list[dict]:
             summaries.append(summary)
         await _populate_permissions(summaries)
         for summary in summaries:
-            await lakebase.watch_upsert_space(summary)
+            await state_store.watch_upsert_space(summary)
     else:
-        summaries = await lakebase.watch_list_cached_spaces()
+        summaries = await state_store.watch_list_cached_spaces()
 
     visible_ids = {s["space_id"] for s in summaries}
 
@@ -184,7 +184,7 @@ async def get_space(space_id: str) -> dict:
 
     cached = {
         s["space_id"]: s.get("permissions") or []
-        for s in await lakebase.watch_list_cached_spaces()
+        for s in await state_store.watch_list_cached_spaces()
     }
     permissions = cached.get(sid, [])
     try:
@@ -194,7 +194,7 @@ async def get_space(space_id: str) -> dict:
         logger.info("list_space_permissions(%s) failed: %s", sid, e)
 
     summary = _to_summary(raw, permissions=permissions)
-    await lakebase.watch_upsert_space(summary)
+    await state_store.watch_upsert_space(summary)
     return WatchSpaceSummary(**summary).model_dump(mode="json")
 
 

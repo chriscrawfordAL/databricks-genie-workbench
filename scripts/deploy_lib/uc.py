@@ -294,6 +294,79 @@ def grant_watch_system_tables(w, principal: str) -> list[str]:
     return failures
 
 
+# The Workbench Delta state table (backend/services/delta_store.py) is created by the
+# app at runtime, but the app never creates its schema — the installer must, and grant
+# the app SP what the table needs. Only applies when the install sets a state location.
+SP_STATE_CATALOG_PRIVILEGES = {"USE_CATALOG"}
+SP_STATE_SCHEMA_PRIVILEGES = {"USE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY"}
+
+
+def ensure_state_schema_and_grants(w, cfg: InstallConfig, app_sp_client_id: str) -> dict[str, Any]:
+    """Create the state schema if missing and grant the app SP access to it (idempotent).
+
+    Catalog grant failures from a non-owner deployer are tolerated, as for the GSO schema;
+    the verification result names anything still missing so the install can report it.
+    """
+    catalog, schema = cfg.state_catalog, cfg.state_schema
+    sql_exec(
+        w,
+        cfg.warehouse_id,
+        (
+            f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema} "
+            "COMMENT 'Genie Workbench app state (Delta)'"
+        ),
+    )
+    try:
+        update_grants(
+            w,
+            securable_type="catalog",
+            full_name=catalog,
+            principal=app_sp_client_id,
+            add=sorted(SP_STATE_CATALOG_PRIVILEGES),
+        )
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "manage" not in msg and "permission" not in msg:
+            raise
+    update_grants(
+        w,
+        securable_type="schema",
+        full_name=f"{catalog}.{schema}",
+        principal=app_sp_client_id,
+        add=sorted(SP_STATE_SCHEMA_PRIVILEGES),
+    )
+    have_catalog = extract_principal_privileges(get_grants(w, securable_type="catalog", full_name=catalog), app_sp_client_id)
+    have_schema = extract_principal_privileges(
+        get_grants(w, securable_type="schema", full_name=f"{catalog}.{schema}"), app_sp_client_id
+    )
+    return {
+        "state_location": f"{catalog}.{schema}",
+        "missing_catalog": sorted(SP_STATE_CATALOG_PRIVILEGES - have_catalog),
+        "missing_schema": sorted(SP_STATE_SCHEMA_PRIVILEGES - have_schema),
+    }
+
+
+def ensure_workspaces_secret_scope(w, scope: str, app_sp_client_id: str) -> str | None:
+    """Best-effort: create the cross-workspace secret scope and grant the app SP MANAGE.
+
+    The scope holds client secrets of dedicated service principals registered for
+    other workspaces (Admin > Workspaces). Returns an error string, or None on
+    success; never raises so the install keeps going.
+    """
+    from databricks.sdk.service.workspace import AclPermission
+
+    try:
+        try:
+            w.secrets.create_scope(scope=scope)
+        except Exception as err:  # noqa: BLE001
+            if "ALREADY_EXISTS" not in str(err).upper():
+                raise
+        w.secrets.put_acl(scope=scope, principal=app_sp_client_id, permission=AclPermission.MANAGE)
+        return None
+    except Exception as err:  # noqa: BLE001
+        return f"Could not prepare secret scope '{scope}': {err}"
+
+
 def ensure_uc_objects_and_grants(w, cfg: InstallConfig, app_sp_client_id: str) -> dict[str, Any]:
     ensure_schema(w, cfg.catalog, cfg.gso_schema, cfg.warehouse_id)
     ensure_volume(w, cfg.catalog, cfg.gso_schema, cfg.warehouse_id)
@@ -304,5 +377,10 @@ def ensure_uc_objects_and_grants(w, cfg: InstallConfig, app_sp_client_id: str) -
     watch_grant_failures = grant_watch_system_tables(w, app_sp_client_id)
     verification = verify_required_privileges(w, cfg.catalog, cfg.gso_schema, app_sp_client_id)
     verification["watch_system_table_grant_failures"] = watch_grant_failures
+    if cfg.state_catalog:
+        verification["state_schema"] = ensure_state_schema_and_grants(w, cfg, app_sp_client_id)
+    verification["workspaces_secret_scope_error"] = ensure_workspaces_secret_scope(
+        w, cfg.workspaces_secret_scope, app_sp_client_id
+    )
     return verification
 

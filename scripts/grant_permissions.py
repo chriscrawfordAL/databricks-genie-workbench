@@ -9,7 +9,8 @@ Usage:
         --app-name genie-workbench \
         --catalog main \
         --schema genie_space_optimizer \
-        --warehouse-id <warehouse-id>
+        --warehouse-id <warehouse-id> \
+        [--workspaces-secret-scope genie-workbench-workspaces]
 """
 
 import argparse
@@ -30,6 +31,7 @@ if os.path.isdir(_GSO_SRC) and _GSO_SRC not in sys.path:
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 from deploy_lib.uc import WATCH_SYSTEM_GRANTS, vc_observe_statements
+from deploy_lib.config import DEFAULT_WORKSPACES_SECRET_SCOPE
 
 # SP privileges on the GSO optimization schema — the SP runs optimization jobs
 # and needs full write access to state tables, MLflow models, and prompts.
@@ -321,6 +323,75 @@ def _verify_required_privileges(
         )
 
 
+def _ensure_workspaces_secret_scope(*, profile: str, scope: str, principal: str) -> None:
+    """Create the cross-workspace secret scope if missing and grant the app SP MANAGE.
+
+    The scope holds the client secrets of service principals registered for remote
+    workspaces. Best-effort: cross-workspace support is optional, so any failure is a
+    warning and never fails the deploy.
+    """
+    try:
+        listed = _run(["databricks", "secrets", "list-scopes", "--profile", profile, "-o", "json"])
+        scopes = json.loads(listed) if listed else []
+        names = {str(item.get("name")) for item in scopes if isinstance(item, dict)}
+        if scope in names:
+            print(f"[grant-permissions] Secret scope exists: {scope}")
+        else:
+            _run(["databricks", "secrets", "create-scope", scope, "--profile", profile])
+            print(f"[grant-permissions] Secret scope created: {scope}")
+        _run([
+            "databricks", "secrets", "put-acl", scope, principal, "MANAGE",
+            "--profile", profile,
+        ])
+        print(f"[grant-permissions] Secret scope {scope}: MANAGE granted to {principal}")
+    except Exception as err:
+        print(
+            f"[grant-permissions] WARNING: could not set up cross-workspace secret scope "
+            f"'{scope}' (optional; the deploy continues). Create it and grant MANAGE to "
+            f"{principal} by hand if you use cross-workspace support.\n  {err}",
+            file=sys.stderr,
+        )
+
+
+def _ensure_state_schema_and_grants(
+    *, profile: str, catalog: str, schema: str, warehouse_id: str | None, principal: str,
+) -> None:
+    """Best-effort: create the app's Delta state schema and grant the app SP.
+
+    Only used when the deploy pre-sets the state location (GENIE_STATE_CATALOG);
+    otherwise an admin does this in the app's Setup dialog. Never fails the
+    deploy — the Setup dialog can still finish the job.
+    """
+    fqn = f"{catalog}.{schema}"
+    try:
+        if warehouse_id:
+            stmt = (
+                f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}` "
+                "COMMENT 'Genie Workbench app state'"
+            )
+            result = _sql_exec(profile=profile, warehouse_id=warehouse_id, statement=stmt)
+            result = _await_sql(result, profile=profile, label=f"State schema {fqn}")
+            state = (result.get("status") or {}).get("state", "")
+            if state != "SUCCEEDED":
+                err = (result.get("status") or {}).get("error", {}).get("message", "unknown")
+                raise RuntimeError(f"state schema creation failed ({state}): {err}")
+        try:
+            _update_grants(profile=profile, securable_type="catalog", full_name=catalog,
+                           principal=principal, add=["USE_CATALOG"])
+        except Exception as err:  # noqa: BLE001 - catalog grant may need an owner
+            print(f"[grant-permissions] WARNING: Could not grant USE_CATALOG on '{catalog}': {err}",
+                  file=sys.stderr)
+        _update_grants(profile=profile, securable_type="schema", full_name=fqn, principal=principal,
+                       add=["CREATE_TABLE", "MODIFY", "SELECT", "USE_SCHEMA"])
+        print(f"[grant-permissions] App state schema ready: {fqn} (Delta)")
+    except Exception as err:  # noqa: BLE001
+        print(
+            f"[grant-permissions] WARNING: Could not prepare the app state schema {fqn}: {err}\n"
+            "  A workspace admin can finish this in the app's Setup dialog.",
+            file=sys.stderr,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Grant Unity Catalog privileges to Genie Workbench app SP.",
@@ -330,7 +401,21 @@ def main() -> int:
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--schema", required=True)
     parser.add_argument("--warehouse-id", default=None)
+    parser.add_argument(
+        "--workspaces-secret-scope", default=None,
+        help="Secret scope for cross-workspace SP secrets "
+             "(default: $WORKSPACES_SECRET_SCOPE, then genie-workbench-workspaces)",
+    )
+    parser.add_argument("--state-catalog", default=None,
+                        help="Catalog for the app's Delta state tables (optional)")
+    parser.add_argument("--state-schema", default=None,
+                        help="Schema for the app's Delta state tables (default genie_workbench_state)")
     args = parser.parse_args()
+    workspaces_scope = (
+        args.workspaces_secret_scope
+        or os.environ.get("WORKSPACES_SECRET_SCOPE", "").strip()
+        or DEFAULT_WORKSPACES_SECRET_SCOPE
+    )
 
     # Create schema and volume if warehouse ID provided
     if args.warehouse_id:
@@ -382,6 +467,17 @@ def main() -> int:
     if not principal:
         raise RuntimeError(
             "Could not resolve app service principal from `databricks apps get` output.",
+        )
+
+    _ensure_workspaces_secret_scope(profile=args.profile, scope=workspaces_scope, principal=principal)
+
+    if (args.state_catalog or "").strip():
+        _ensure_state_schema_and_grants(
+            profile=args.profile,
+            catalog=args.state_catalog.strip(),
+            schema=(args.state_schema or "").strip() or "genie_workbench_state",
+            warehouse_id=args.warehouse_id,
+            principal=principal,
         )
 
     schema_fqn = f"{args.catalog}.{args.schema}"

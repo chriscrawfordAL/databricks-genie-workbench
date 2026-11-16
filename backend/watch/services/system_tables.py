@@ -25,7 +25,8 @@ from typing import Any
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementParameterListItem, StatementState
 
-from backend.services.auth import get_service_principal_client
+from backend.services import transfer_meter
+from backend.services.auth import get_service_principal_client, get_target_workspace_id
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,13 @@ _CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 # one fails with a permission error. Surfaced via /api/watch/settings/health so
 # the UI can distinguish "missing SP grants" from "no activity" (which both
 # otherwise return empty results). See `scripts/grant_permissions.py`.
-_SYSTEM_TABLES_ACCESSIBLE: bool | None = None
+# Tracked per target workspace ("home" or a remote connection id), since each
+# workspace's service principal has its own grants.
+_SYSTEM_TABLES_ACCESSIBLE: dict[str, bool] = {}
+
+
+def _target_key() -> str:
+    return get_target_workspace_id() or "home"
 
 
 def _looks_like_permission_error(msg: str) -> bool:
@@ -63,12 +70,14 @@ def _looks_like_permission_error(msg: str) -> bool:
 
 def system_tables_status() -> bool | None:
     """Last observed system-table accessibility (None=unknown, False=grants missing)."""
-    return _SYSTEM_TABLES_ACCESSIBLE
+    return _SYSTEM_TABLES_ACCESSIBLE.get(_target_key())
 
 
 def _cache_key(sql: str, parameters: list[StatementParameterListItem]) -> str:
     bag = sorted([(p.name, p.value, getattr(p.type, "value", str(p.type))) for p in parameters])
-    return f"{hash(sql)}|{json.dumps(bag)}"
+    # Scope by target workspace so a remote workspace's results never collide
+    # with home's (or another remote's) under the same SQL + params.
+    return f"{_target_key()}|{hash(sql)}|{json.dumps(bag)}"
 
 
 def _cache_get(key: str, ttl_seconds: int = _CACHE_TTL_SECONDS) -> list[dict[str, Any]] | None:
@@ -106,6 +115,18 @@ def warm_cost_overview_cache(days: int = 7) -> None:
 
 
 def _warehouse_id() -> str:
+    # A remote target has no access to the home SQL_WAREHOUSE_ID; use the
+    # connection's warehouse or one the remote service principal can see.
+    if get_target_workspace_id():
+        from backend.sql_executor import get_sql_warehouse_id
+
+        wh = get_sql_warehouse_id() or ""
+        if not wh:
+            raise RuntimeError(
+                "No SQL warehouse is available to the app in the selected workspace — "
+                "system table queries cannot run there."
+            )
+        return wh
     wh = os.environ.get("SQL_WAREHOUSE_ID", "").strip()
     if not wh:
         raise RuntimeError("SQL_WAREHOUSE_ID env var is empty — system table queries cannot run.")
@@ -124,7 +145,6 @@ def _run(
     track_health: bool = True,
     ttl_seconds: int = _CACHE_TTL_SECONDS,
 ) -> list[dict[str, Any]]:
-    global _SYSTEM_TABLES_ACCESSIBLE
     key = _cache_key(sql, parameters)
     cached = _cache_get(key, ttl_seconds=ttl_seconds)
     if cached is not None:
@@ -163,12 +183,12 @@ def _run(
         err = resp.status.error
         msg = err.message if err else state
         if track_health and _looks_like_permission_error(str(msg)):
-            _SYSTEM_TABLES_ACCESSIBLE = False
+            _SYSTEM_TABLES_ACCESSIBLE[_target_key()] = False
         logger.warning("system-table query %s ended in %s: %s", statement_id, state, msg)
         return []
 
     if track_health:
-        _SYSTEM_TABLES_ACCESSIBLE = True
+        _SYSTEM_TABLES_ACCESSIBLE[_target_key()] = True
 
     if not resp.result or not resp.result.data_array:
         return []
@@ -180,6 +200,8 @@ def _run(
         {cols[i]: row[i] for i in range(len(cols))}
         for row in resp.result.data_array
     ]
+    # Count monitoring bytes pulled in from a remote workspace (cache misses only).
+    transfer_meter.record_current(transfer_meter.CATEGORY_SYSTEM_TABLES, resp.result.data_array)
     _cache_put(key, rows)
     return rows
 
@@ -202,25 +224,26 @@ def _p(name: str, value: Any, value_type: str = "STRING") -> StatementParameterL
 # remains the source for the *set* of spaces and their metadata (titles,
 # configured data sources); it has no cost/usage/lineage data of its own.
 
-_CURRENT_WS_ID: str | None = None
-_CURRENT_WS_ID_RESOLVED = False
+# Resolved numeric workspace ids, cached per target ("home" or a connection id).
+_WS_ID_CACHE: dict[str, str | None] = {}
 
 
 def _current_workspace_id() -> str | None:
-    """This app's own workspace id, resolved once via the SDK (cached).
+    """The numeric workspace id to scope system-table queries to.
 
-    Returns None if resolution fails; `_ws_clause` then fails *closed*
-    (scopes the query to no rows) rather than leaking other workspaces' data.
+    For a remote target this is the remote workspace's id (via the target-aware
+    SP client); at home it is this app's own workspace id. Cached per target.
+    Returns None if resolution fails; `_ws_clause` then fails *closed* (scopes
+    the query to no rows) rather than leaking other workspaces' data.
     """
-    global _CURRENT_WS_ID, _CURRENT_WS_ID_RESOLVED
-    if not _CURRENT_WS_ID_RESOLVED:
-        _CURRENT_WS_ID_RESOLVED = True
+    key = _target_key()
+    if key not in _WS_ID_CACHE:
         try:
-            _CURRENT_WS_ID = str(_client().get_workspace_id())
+            _WS_ID_CACHE[key] = str(_client().get_workspace_id())
         except Exception as e:  # noqa: BLE001 - never break queries on this
-            logger.warning("could not resolve current workspace id: %s", e)
-            _CURRENT_WS_ID = None
-    return _CURRENT_WS_ID
+            logger.warning("could not resolve workspace id for %s: %s", key, e)
+            return None
+    return _WS_ID_CACHE[key]
 
 
 def _ws_clause(params: list[StatementParameterListItem], col: str = "workspace_id") -> str:

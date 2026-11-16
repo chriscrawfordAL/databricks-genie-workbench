@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from backend.services.auth import get_service_principal_client, get_workspace_client
+from backend.services.auth import get_home_service_principal_client, get_home_workspace_client
 from backend.services.llm_route import (
     LLMRoute,
     MODEL_UNAVAILABLE_MESSAGE,
@@ -112,7 +112,9 @@ def call_serving_endpoint(
     if model is None:
         model = get_llm_model()
 
-    client = get_workspace_client()
+    # LLM inference always runs in the home workspace, even when the request
+    # targets a remote workspace (serving endpoints / AI Gateway live at home).
+    client = get_home_workspace_client()
     host = client.config.host.rstrip("/")
 
     # Use SDK auth machinery to get proper headers for any auth type
@@ -137,7 +139,7 @@ def call_serving_endpoint(
         and resp.status_code == 403
         and is_gateway_scope_403(resp.status_code, resp.text)
     ):
-        sp_client = get_service_principal_client()
+        sp_client = get_home_service_principal_client()
         if sp_client is not client:
             logger.warning(
                 "%s: user token lacks the ai-gateway scope; retrying the gateway call as the "

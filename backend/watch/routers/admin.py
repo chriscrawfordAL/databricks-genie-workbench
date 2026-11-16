@@ -7,7 +7,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, Query
 
-from backend.services import lakebase
+from backend.services import state_store
 from backend.watch._auth import require_admin
 from backend.watch.services import system_tables
 
@@ -29,7 +29,7 @@ async def refresh_rollup(days: int = Query(7, ge=1, le=90)) -> dict:
             continue
         c = cost.get(sid) or {}
         f = fb.get(sid) or {}
-        await lakebase.watch_upsert_daily_rollup({
+        await state_store.watch_upsert_daily_rollup({
             "space_id": sid,
             "day": today,
             "queries": int(u.get("queries") or 0),

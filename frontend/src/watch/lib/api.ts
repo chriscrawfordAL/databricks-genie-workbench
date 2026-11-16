@@ -19,6 +19,7 @@ import type {
   UsageRollup,
   WorkspaceOverview,
 } from '@/watch/types/api'
+import { getActiveWorkspaceId } from '@/lib/api'
 
 const API_BASE = '/api/watch'
 // Backend caps statement_execution polling at 180s plus 50s wait_timeout
@@ -51,6 +52,7 @@ async function fetchJson<T>(
       headers: {
         'Content-Type': 'application/json',
         ...(init.headers || {}),
+        ...(getActiveWorkspaceId() ? { 'X-Target-Workspace': getActiveWorkspaceId() as string } : {}),
       },
     })
     if (!res.ok) {

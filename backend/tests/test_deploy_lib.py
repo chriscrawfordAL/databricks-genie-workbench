@@ -14,7 +14,7 @@ from scripts.deploy_lib.apps import (
     require_successful_deployment,
     wait_for_deployment,
 )
-from scripts.deploy_lib.config import InstallConfig, LakebaseInfo
+from scripts.deploy_lib.config import InstallConfig
 from scripts.deploy_lib.genie_spaces import optionally_grant_genie_spaces
 from scripts.deploy_lib import gso_job
 from scripts.deploy_lib.install import llm_route_replacements, release_check_replacements
@@ -27,9 +27,10 @@ from scripts.deploy_lib.gso_job import (
     upload_job_notebooks,
     upsert_job,
 )
-from scripts.deploy_lib.lakebase import ensure_lakebase, get_database_resource
 from scripts.deploy_lib.uc import (
     VC_OBSERVE_DDL_FILES,
+    ensure_state_schema_and_grants,
+    ensure_uc_objects_and_grants,
     ensure_vc_tables,
     update_grants,
     vc_observe_statements,
@@ -45,7 +46,7 @@ from scripts.deploy_lib.workspace_source import read_workspace_text, source_path
 from scripts.deploy_lib.install import (
     app_env,
     prior_app_yaml_paths,
-    reuse_recorded_lakebase,
+    reuse_recorded_state_location,
     run_install,
 )
 
@@ -103,67 +104,6 @@ class FakeApps:
         )()
 
 
-class FakeOp:
-    def wait(self):
-        return None
-
-
-class FakeProject:
-    def __init__(self, name, *, delete_time=None):
-        self.name = name
-        self.delete_time = delete_time
-
-
-class FakePostgres:
-    def __init__(self, *, project_exists=True, soft_deleted=False, reserved_soft_deleted=None):
-        self.project_exists = project_exists
-        # When True, get_project returns a project whose delete_time is set —
-        # Lakebase reports soft-deleted projects as if live.
-        self.soft_deleted = soft_deleted
-        # Project names that only surface as soft-deleted via list_projects:
-        # the reservation that makes a same-name create fail after get 404s.
-        self.reserved_soft_deleted = list(reserved_soft_deleted or [])
-        self.created_projects = []
-        self.created_roles = []
-        self.purged_projects = []
-
-    def get_project(self, *, name):
-        if not self.project_exists:
-            from databricks.sdk.errors import NotFound
-
-            raise NotFound(f"{name} not found")
-        return FakeProject(name, delete_time="2026-06-20T00:00:00Z" if self.soft_deleted else None)
-
-    def list_projects(self, *, show_deleted=False):
-        if not show_deleted:
-            return []
-        return [
-            FakeProject(f"projects/{name}", delete_time="2026-06-20T00:00:00Z")
-            for name in self.reserved_soft_deleted
-        ]
-
-    def delete_project(self, *, name, purge=False):
-        self.purged_projects.append((name, purge))
-        # Purging frees the reserved name so the subsequent create succeeds.
-        self.soft_deleted = False
-        self.project_exists = False
-        self.reserved_soft_deleted = [n for n in self.reserved_soft_deleted if f"projects/{n}" != name]
-        return FakeOp()
-
-    def create_project(self, *, project, project_id):
-        self.created_projects.append(project_id)
-        self.project_exists = True
-        self.soft_deleted = False
-        return FakeOp()
-
-    def create_role(self, **kwargs):
-        self.created_roles.append(kwargs)
-        return FakeOp()
-
-    def get_endpoint(self, *, name):
-        raise RuntimeError(f"{name} unavailable")
-
-
 def test_render_text_replaces_placeholders_and_fails_on_unresolved():
     rendered = render_text(
         "warehouse=__WAREHOUSE_ID__ model=__LLM_MODEL__",
@@ -183,7 +123,9 @@ def test_all_current_app_yaml_placeholders_are_covered():
             "WAREHOUSE_ID": "wh",
             "GSO_CATALOG": "main",
             "GSO_JOB_ID": "123",
-            "LAKEBASE_INSTANCE": "genie-workbench-lakebase",
+            "WORKBENCH_STATE_CATALOG": "",
+            "WORKBENCH_STATE_SCHEMA": "",
+            "WORKSPACES_SECRET_SCOPE": "genie-workbench-workspaces",
             "LLM_MODEL": "databricks-claude-sonnet-4-6",
             **llm_route_replacements(
                 InstallConfig(app_name="a", catalog="c", warehouse_id="w").normalized()
@@ -202,50 +144,38 @@ def test_all_current_app_yaml_placeholders_are_covered():
     assert "__" not in rendered
 
 
-def test_config_validation_normalizes_lakebase_defaults():
-    cfg = InstallConfig(
-        app_name="genie-workbench",
-        catalog="main",
-        warehouse_id="abc",
-        repo_root="/Workspace/Repos/me/repo",
-        lakebase_mode="create",
-    ).normalized()
-
-    assert cfg.lakebase_instance == "genie-workbench-lakebase"
+def test_config_state_location_defaults_and_validation():
+    base = dict(app_name="genie-workbench", catalog="main", warehouse_id="abc", repo_root="/Workspace/Repos/me/repo")
+    cfg = InstallConfig(**base).normalized()
     assert cfg.gso_job_name == "genie-workbench-gso-optimization-job"
     cfg.validate()
-
-    explicit_cfg = InstallConfig(
-        app_name="genie-workbench",
-        catalog="main",
-        warehouse_id="abc",
-        repo_root="/Workspace/Repos/me/repo",
-        lakebase_mode="create",
-        lakebase_instance="custom-lakebase",
-    ).normalized()
-    assert explicit_cfg.lakebase_instance == "custom-lakebase"
+    # Blank state_catalog: the admin picks the location in the app's Setup dialog, so both render empty.
+    assert (cfg.state_catalog, cfg.state_schema) == (None, None)
+    # A catalog alone gets the default schema; an explicit schema is kept.
+    assert InstallConfig(**base, state_catalog="ops").normalized().state_schema == "genie_workbench_state"
+    explicit = InstallConfig(**base, state_catalog="ops", state_schema="wb_state").normalized()
+    assert (explicit.state_catalog, explicit.state_schema) == ("ops", "wb_state")
+    # A schema without a catalog is meaningless and is dropped.
+    assert InstallConfig(**base, state_schema="wb_state").normalized().state_schema is None
+    assert InstallConfig(**base).normalized().workspaces_secret_scope == "genie-workbench-workspaces"
+    assert InstallConfig(**base, workspaces_secret_scope=" my-scope ").normalized().workspaces_secret_scope == "my-scope"
 
     with pytest.raises(ValueError, match="app_name"):
         InstallConfig(app_name="Bad Name", catalog="main", warehouse_id="abc", repo_root="/tmp").validate()
-
-    with pytest.raises(ValueError, match="lakebase_instance"):
-        InstallConfig(
-            app_name="genie-workbench",
-            catalog="main",
-            warehouse_id="abc",
-            repo_root="/tmp",
-            lakebase_mode="existing",
-        ).validate()
+    with pytest.raises(ValueError, match="state_catalog"):
+        InstallConfig(**base, state_catalog="my-catalog").validate()
+    with pytest.raises(ValueError, match="state_schema"):
+        InstallConfig(**base, state_catalog="ops", state_schema="a.b").validate()
 
 
 def test_notebook_installer_uses_streamlined_widgets_and_defaults():
     notebook_source = Path("notebooks/install.py").read_text()
 
-    assert 'dbutils.widgets.text("lakebase_project_name", "")' in notebook_source
-    assert 'dbutils.widgets.get("lakebase_project_name").strip()' in notebook_source
-    assert 'lakebase_instance = f"{app_name}-lakebase"' in notebook_source
-    assert 'dbutils.widgets.text("lakebase_instance"' not in notebook_source
-    assert 'dbutils.widgets.get("lakebase_instance")' not in notebook_source
+    assert 'dbutils.widgets.text("state_catalog", "")' in notebook_source
+    assert 'dbutils.widgets.text("state_schema", "genie_workbench_state")' in notebook_source
+    assert "state_catalog=state_catalog or None" in notebook_source
+    assert "lakebase" not in notebook_source.lower()
+    assert "psycopg" not in notebook_source
 
     assert 'dbutils.widgets.text("mlflow_experiment_id"' not in notebook_source
     assert 'dbutils.widgets.get("mlflow_experiment_id")' not in notebook_source
@@ -448,13 +378,14 @@ def test_mkdirs_uses_object_path_for_workspace_prefixed_paths():
     ]
 
 
-def test_patch_app_resources_preserves_existing_and_adds_postgres():
+def test_patch_app_resources_keeps_existing_and_drops_a_lakebase_resource():
     w = FakeWorkspaceClient(
         {
             ("GET", "/api/2.0/apps/genie-workbench"): {
                 "resources": [
                     {"name": "keep-me", "secret": {"scope": "s", "key": "k"}},
                     {"name": "postgres"},
+                    {"name": "lakebase-db", "postgres": {"branch": "b", "database": "d"}},
                 ]
             }
         }
@@ -465,20 +396,14 @@ def test_patch_app_resources_preserves_existing_and_adds_postgres():
         warehouse_id="warehouse-1",
         repo_root="/tmp",
     )
-    lakebase = LakebaseInfo(
-        project_name="lb",
-        branch_resource="projects/lb/branches/production",
-        database_resource="projects/lb/branches/production/databases/databricks_postgres",
-        endpoint_resource="projects/lb/branches/production/endpoints/primary",
-        grants_applied=True,
-    )
 
-    payload = patch_app_resources(w, cfg, lakebase)
+    payload = patch_app_resources(w, cfg)
 
     resources = {r["name"]: r for r in payload["resources"]}
     assert resources["sql-warehouse"]["sql_warehouse"]["id"] == "warehouse-1"
-    assert resources["postgres"]["postgres"]["permission"] == "CAN_CONNECT_AND_CREATE"
     assert "keep-me" in resources
+    # Lakebase is gone: an existing postgres resource from an older install is dropped, not preserved.
+    assert "postgres" not in resources and "lakebase-db" not in resources
     assert "iam.access-control:read" not in payload["user_api_scopes"]
     assert any(call[0] == "PATCH" and call[1] == "/api/2.0/apps/genie-workbench" for call in w.api_client.calls)
 
@@ -1434,148 +1359,89 @@ def test_ensure_vc_tables_names_the_failing_ddl_file():
         ensure_vc_tables(w, "main", "gso", "wh")
 
 
-def test_lakebase_get_database_resource_reads_first_database_name():
-    w = FakeWorkspaceClient(
-        {
-            (
-                "GET",
-                "/api/2.0/postgres/projects/lb/branches/production/databases",
-            ): {
-                "databases": [
-                    {"name": "projects/lb/branches/production/databases/databricks_postgres"}
-                ]
-            }
-        }
-    )
-    assert (
-        get_database_resource(w, "lb")
-        == "projects/lb/branches/production/databases/databricks_postgres"
-    )
-
-
-def test_lakebase_existing_mode_requires_existing_project():
-    w = FakeWorkspaceClient()
-    w.postgres = FakePostgres(project_exists=False)
-    cfg = InstallConfig(
-        app_name="genie-workbench",
-        catalog="main",
-        warehouse_id="wh",
-        repo_root="/tmp",
-        lakebase_mode="existing",
-        lakebase_instance="missing-lakebase",
-    )
-
-    with pytest.raises(RuntimeError, match="missing-lakebase.*does not exist"):
-        ensure_lakebase(w, cfg, "sp-client-id")
-
-    assert w.postgres.created_projects == []
-
-
-def test_lakebase_create_mode_creates_missing_project():
-    w = FakeWorkspaceClient(
-        {
-            (
-                "GET",
-                "/api/2.0/postgres/projects/new-lakebase/branches/production/databases",
-            ): {
-                "databases": [
-                    {"name": "projects/new-lakebase/branches/production/databases/databricks_postgres"}
-                ]
-            }
-        }
-    )
-    w.config = type("Config", (), {"client_id": None})()
-    w.postgres = FakePostgres(project_exists=False)
-    cfg = InstallConfig(
-        app_name="genie-workbench",
-        catalog="main",
-        warehouse_id="wh",
-        repo_root="/tmp",
-        lakebase_mode="create",
-        lakebase_instance="new-lakebase",
-    )
-
-    lakebase = ensure_lakebase(w, cfg, "sp-client-id")
-
-    assert w.postgres.created_projects == ["new-lakebase"]
-    assert w.postgres.purged_projects == []
-    assert lakebase.database_resource == "projects/new-lakebase/branches/production/databases/databricks_postgres"
-
-
-def _databases_response():
-    return {
-        (
-            "GET",
-            "/api/2.0/postgres/projects/new-lakebase/branches/production/databases",
-        ): {
-            "databases": [
-                {"name": "projects/new-lakebase/branches/production/databases/databricks_postgres"}
+def test_state_schema_is_created_and_granted_when_state_catalog_is_set():
+    sp = "sp-client-id"
+    responses = {
+        ("POST", "/api/2.0/sql/statements"): {"status": {"state": "SUCCEEDED"}},
+        ("GET", "/api/2.1/unity-catalog/permissions/catalog/ops"): {
+            "privilege_assignments": [{"principal": sp, "privileges": [{"privilege": "USE_CATALOG"}]}]
+        },
+        ("GET", "/api/2.1/unity-catalog/permissions/schema/ops.wb_state"): {
+            "privilege_assignments": [
+                {
+                    "principal": sp,
+                    "privileges": [
+                        {"privilege": "USE_SCHEMA"},
+                        {"privilege": "CREATE_TABLE"},
+                        {"privilege": "SELECT"},
+                        {"privilege": "MODIFY"},
+                    ],
+                }
             ]
-        }
+        },
     }
-
-
-def test_lakebase_create_mode_purges_soft_deleted_name_reservation():
-    # Reported failure: get_project 404s, but the name is still reserved by a
-    # soft-deleted project that surfaces via list_projects(show_deleted=True).
-    w = FakeWorkspaceClient(_databases_response())
-    w.config = type("Config", (), {"client_id": None})()
-    w.postgres = FakePostgres(project_exists=False, reserved_soft_deleted=["new-lakebase"])
+    w = FakeWorkspaceClient(responses)
     cfg = InstallConfig(
-        app_name="genie-workbench",
-        catalog="main",
-        warehouse_id="wh",
-        repo_root="/tmp",
-        lakebase_mode="create",
-        lakebase_instance="new-lakebase",
+        app_name="gwb", catalog="main", warehouse_id="wh", repo_root="/r", state_catalog="ops", state_schema="wb_state"
+    ).normalized()
+
+    result = ensure_state_schema_and_grants(w, cfg, sp)
+
+    sql = [body["statement"] for method, path, body in w.api_client.calls if path == "/api/2.0/sql/statements"]
+    assert sql == ["CREATE SCHEMA IF NOT EXISTS ops.wb_state COMMENT 'Genie Workbench app state (Delta)'"]
+    grants = {
+        (path, tuple(body["changes"][0]["add"]))
+        for method, path, body in w.api_client.calls
+        if method == "PATCH"
+    }
+    assert grants == {
+        ("/api/2.1/unity-catalog/permissions/catalog/ops", ("USE_CATALOG",)),
+        ("/api/2.1/unity-catalog/permissions/schema/ops.wb_state", ("CREATE_TABLE", "MODIFY", "SELECT", "USE_SCHEMA")),
+    }
+    assert result == {"state_location": "ops.wb_state", "missing_catalog": [], "missing_schema": []}
+
+
+def test_missing_state_privileges_are_reported_for_the_install_summary():
+    sp = "sp-client-id"
+    w = FakeWorkspaceClient(
+        {
+            ("POST", "/api/2.0/sql/statements"): {"status": {"state": "SUCCEEDED"}},
+            ("GET", "/api/2.1/unity-catalog/permissions/catalog/ops"): {"privilege_assignments": []},
+            ("GET", "/api/2.1/unity-catalog/permissions/schema/ops.genie_workbench_state"): {
+                "privilege_assignments": [{"principal": sp, "privileges": ["SELECT"]}]
+            },
+        }
     )
-
-    lakebase = ensure_lakebase(w, cfg, "sp-client-id")
-
-    assert w.postgres.purged_projects == [("projects/new-lakebase", True)]
-    assert w.postgres.created_projects == ["new-lakebase"]
-    assert lakebase.database_resource == "projects/new-lakebase/branches/production/databases/databricks_postgres"
+    cfg = InstallConfig(app_name="gwb", catalog="main", warehouse_id="wh", repo_root="/r", state_catalog="ops").normalized()
+    result = ensure_state_schema_and_grants(w, cfg, sp)
+    assert result["missing_catalog"] == ["USE_CATALOG"]
+    assert result["missing_schema"] == ["CREATE_TABLE", "MODIFY", "USE_SCHEMA"]
 
 
-def test_lakebase_create_mode_purges_project_reported_soft_deleted_by_get():
-    # get_project returns a soft-deleted project as if live (delete_time set);
-    # create mode must purge and recreate it rather than treat it as usable.
-    w = FakeWorkspaceClient(_databases_response())
-    w.config = type("Config", (), {"client_id": None})()
-    w.postgres = FakePostgres(project_exists=True, soft_deleted=True)
-    cfg = InstallConfig(
-        app_name="genie-workbench",
-        catalog="main",
-        warehouse_id="wh",
-        repo_root="/tmp",
-        lakebase_mode="create",
-        lakebase_instance="new-lakebase",
+def test_uc_install_step_creates_state_schema_only_when_state_catalog_is_set(monkeypatch):
+    from scripts.deploy_lib import uc
+
+    calls = []
+    for name in (
+        "ensure_schema", "ensure_volume", "ensure_tables", "ensure_vc_tables",
+        "grant_schema_privileges", "grant_volume_privileges", "grant_watch_system_tables",
+    ):
+        monkeypatch.setattr(uc, name, lambda *a, _n=name, **k: calls.append(_n) or [])
+    monkeypatch.setattr(uc, "verify_required_privileges", lambda *a, **k: {"missing_catalog": [], "missing_schema": []})
+    monkeypatch.setattr(
+        uc,
+        "ensure_state_schema_and_grants",
+        lambda w, cfg, sp: calls.append("state") or {"state_location": f"{cfg.state_catalog}.{cfg.state_schema}"},
     )
+    base = dict(app_name="gwb", catalog="main", warehouse_id="wh", repo_root="/r")
 
-    lakebase = ensure_lakebase(w, cfg, "sp-client-id")
+    unset = ensure_uc_objects_and_grants(None, InstallConfig(**base).normalized(), "sp")
+    assert "state" not in calls and "state_schema" not in unset
 
-    assert w.postgres.purged_projects == [("projects/new-lakebase", True)]
-    assert w.postgres.created_projects == ["new-lakebase"]
-    assert lakebase.database_resource == "projects/new-lakebase/branches/production/databases/databricks_postgres"
-
-
-def test_lakebase_existing_mode_rejects_soft_deleted_project():
-    w = FakeWorkspaceClient()
-    w.postgres = FakePostgres(project_exists=True, soft_deleted=True)
-    cfg = InstallConfig(
-        app_name="genie-workbench",
-        catalog="main",
-        warehouse_id="wh",
-        repo_root="/tmp",
-        lakebase_mode="existing",
-        lakebase_instance="stale-lakebase",
-    )
-
-    with pytest.raises(RuntimeError, match="stale-lakebase.*soft-deleted"):
-        ensure_lakebase(w, cfg, "sp-client-id")
-
-    assert w.postgres.created_projects == []
-    assert w.postgres.purged_projects == []
+    calls.clear()
+    set_ = ensure_uc_objects_and_grants(None, InstallConfig(**base, state_catalog="ops").normalized(), "sp")
+    assert calls.count("state") == 1
+    assert set_["state_schema"] == {"state_location": "ops.genie_workbench_state"}
 
 
 def test_genie_llm_route_declared_gateway_across_workbench_mirrors():
@@ -1845,7 +1711,7 @@ def test_env_var_reference_documents_the_release_check_and_build_info():
     assert "`Origin: null`" in guide
 
 
-# Spec 11.5 / 11.9: a rerun keeps the app's Lakebase project and settings record.
+# Spec 11.5 / 11.9: a rerun keeps the app's recorded state location and settings record.
 _APP_YAML_02 = """\
 command: ["uvicorn", "backend.main:app"]
 env:
@@ -1859,13 +1725,15 @@ env:
     value: "1234"
   - name: SQL_WAREHOUSE_ID
     valueFrom: sql-warehouse
-  - name: LAKEBASE_INSTANCE_NAME
-    value: "team-lakebase"
+  - name: WORKBENCH_STATE_CATALOG
+    value: "team_state"
+  - name: WORKBENCH_STATE_SCHEMA
+    value: "wb_state"
   - name: GSO_CATALOG
     value: "prod_catalog"
 """
 _APP = {"name": "gwb", "resources": [{"name": "sql-warehouse", "sql_warehouse": {"id": "wh-123", "permission": "CAN_USE"}}]}
-_FULL = InstallConfig(app_name="gwb", catalog="c", warehouse_id="w", repo_root="/r", lakebase_mode="create")
+_FULL = InstallConfig(app_name="gwb", catalog="c", warehouse_id="w", repo_root="/r")
 
 
 def test_app_env_skips_empty_values_placeholders_and_value_from():
@@ -1879,23 +1747,22 @@ def test_app_env_skips_empty_values_placeholders_and_value_from():
     assert app_env("- a\n- b\n") == {}
 
 
-def test_rerun_with_a_blank_lakebase_name_reuses_the_apps_project():
-    cfg = reuse_recorded_lakebase(_FULL, _APP, _APP_YAML_02).normalized()
-    assert cfg.lakebase_instance == "team-lakebase"
+def test_rerun_with_a_blank_state_catalog_keeps_the_recorded_location():
+    cfg = reuse_recorded_state_location(_FULL, _APP_YAML_02).normalized()
+    assert (cfg.state_catalog, cfg.state_schema) == ("team_state", "wb_state")
     assert cfg.catalog == "c"  # a full rerun keeps its widget values for everything else
 
 
-def test_new_app_with_a_blank_lakebase_name_still_gets_the_default_project():
-    assert reuse_recorded_lakebase(_FULL, None, None).normalized().lakebase_instance == "gwb-lakebase"
+def test_new_app_with_a_blank_state_catalog_stays_blank_for_the_setup_dialog():
+    cfg = reuse_recorded_state_location(_FULL, None).normalized()
+    assert (cfg.state_catalog, cfg.state_schema) == (None, None)
 
 
-def test_rerun_lakebase_reuse_only_applies_to_a_blank_create():
-    explicit = replace(_FULL, lakebase_instance="mine")
-    assert reuse_recorded_lakebase(explicit, _APP, _APP_YAML_02).lakebase_instance == "mine"
-    skip = replace(_FULL, lakebase_mode="skip")
-    assert reuse_recorded_lakebase(skip, _APP, _APP_YAML_02).normalized().lakebase_instance is None
-    no_record = _APP_YAML_02.replace('value: "team-lakebase"', 'value: ""')
-    assert reuse_recorded_lakebase(_FULL, _APP, no_record).normalized().lakebase_instance == "gwb-lakebase"
+def test_rerun_state_reuse_never_overrides_an_explicit_catalog():
+    explicit = replace(_FULL, state_catalog="mine")
+    assert reuse_recorded_state_location(explicit, _APP_YAML_02).state_catalog == "mine"
+    no_record = _APP_YAML_02.replace('value: "team_state"', 'value: ""')
+    assert reuse_recorded_state_location(_FULL, no_record).normalized().state_catalog is None
 
 
 def test_prior_app_yaml_paths_lists_the_candidates_in_order():
@@ -1912,28 +1779,27 @@ def test_run_install_rejects_a_bad_app_name_before_calling_the_workspace():
         run_install(SimpleNamespace(), replace(_FULL, app_name="My App"))
 
 
-def test_run_install_reuses_the_apps_lakebase_project_before_validating_or_creating():
+def test_run_install_reuses_the_recorded_state_location_before_validating_or_creating():
     import inspect
 
     from scripts.deploy_lib import install
 
     src = inspect.getsource(install.run_install)
-    assert src.index("reuse_recorded_lakebase(") < src.index("cfg.validate()") < src.index("ensure_app(")
-    assert src.index("require_reused_lakebase_not_deleted(") < src.index("ensure_app(")
+    assert src.index("reuse_recorded_state_location(") < src.index("cfg.validate()") < src.index("ensure_app(")
     assert "cfg.release_check" in src
 
 
-def test_notebook_leaves_a_blank_create_lakebase_name_to_the_installer():
+def test_notebook_leaves_a_blank_state_catalog_to_the_setup_dialog():
     src = Path("notebooks/install.py").read_text()
-    assert "# create + blank: the installer reuses the existing app's project" in src
-    assert 'elif lakebase_mode == "existing":\n    lakebase_instance = f"{app_name}-lakebase"' in src
+    assert "leave `state_catalog` blank" in src
+    assert "complete the " in src and "Setup dialog" in src
 
 
-# Final review fixes (spec 11): interrupted runs and soft-deleted Lakebase projects.
+# Final review fixes (spec 11): interrupted runs.
 _SRC = "/Workspace/Users/me@example.com/.genie-workbench-deploy/gwb/app"
 
 
-def _stub_install(monkeypatch, *, app, app_yaml, postgres=None):
+def _stub_install(monkeypatch, *, app, app_yaml, seen=None):
     """run_install with every workspace call stubbed; the UC step stands in for any later failure."""
     from scripts.deploy_lib import install
 
@@ -1955,11 +1821,13 @@ def _stub_install(monkeypatch, *, app, app_yaml, postgres=None):
         install, "write_workspace_file", lambda w, path, content: calls["written"].__setitem__(path, content)
     )
 
-    def interrupted(*args, **kwargs):
+    def interrupted(w, cfg, sp):
+        if seen is not None:
+            seen.append(cfg)
         raise RuntimeError("interrupted")
 
     monkeypatch.setattr(install, "ensure_uc_objects_and_grants", interrupted)
-    return SimpleNamespace(postgres=postgres or FakePostgres()), calls
+    return SimpleNamespace(), calls
 
 
 def test_an_interrupted_run_leaves_the_apps_current_settings_in_place(monkeypatch):
@@ -1983,35 +1851,33 @@ def test_prior_app_yaml_paths_reads_the_deployment_snapshot_first():
     ]
 
 
-def test_a_rerun_never_purges_the_apps_deleted_lakebase_project(monkeypatch):
-    w, calls = _stub_install(monkeypatch, app=_APP, app_yaml=_APP_YAML_02, postgres=FakePostgres(soft_deleted=True))
-    with pytest.raises(RuntimeError, match=r"The Lakebase project 'team-lakebase' that app 'gwb' uses is deleted"):
-        run_install(w, _FULL, status_fn=lambda message: None)
-    assert calls["ensure_app"] == 0
-    assert w.postgres.purged_projects == []
-
-
-def test_a_rerun_never_purges_a_deleted_project_that_get_reports_as_not_found(monkeypatch):
-    # Lakebase can also 404 on get_project for a soft-deleted project; ensure_project then
-    # finds it via list_projects(show_deleted=True) and purges it. The guard must catch this too.
-    postgres = FakePostgres(project_exists=False, reserved_soft_deleted=["team-lakebase"])
-    w, calls = _stub_install(monkeypatch, app=_APP, app_yaml=_APP_YAML_02, postgres=postgres)
-    with pytest.raises(RuntimeError, match=r"The Lakebase project 'team-lakebase' that app 'gwb' uses is deleted"):
-        run_install(w, _FULL, status_fn=lambda message: None)
-    assert calls["ensure_app"] == 0
-    assert w.postgres.purged_projects == []
-
-
 def test_run_install_rejects_a_bad_config_before_calling_the_workspace():
     with pytest.raises(ValueError, match="catalog is required"):
         run_install(SimpleNamespace(), replace(_FULL, catalog=""))
 
 
-def test_a_rerun_recreates_the_apps_lakebase_project_if_it_is_gone(monkeypatch):
-    w, calls = _stub_install(monkeypatch, app=_APP, app_yaml=_APP_YAML_02, postgres=FakePostgres(project_exists=False))
-    with pytest.raises(RuntimeError, match="interrupted"):  # got past the Lakebase check
+def test_a_rerun_passes_the_recorded_state_location_to_the_uc_step(monkeypatch):
+    seen = []
+    w, calls = _stub_install(monkeypatch, app=_APP, app_yaml=_APP_YAML_02, seen=seen)
+    with pytest.raises(RuntimeError, match="interrupted"):
         run_install(w, _FULL, status_fn=lambda message: None)
+    assert (seen[0].state_catalog, seen[0].state_schema) == ("team_state", "wb_state")
     assert calls["ensure_app"] == 1
+
+
+def test_app_yaml_renders_the_state_placeholders_and_no_postgres_resource():
+    yaml = pytest.importorskip("yaml")
+    template = Path("app.yaml").read_text()
+    assert "valueFrom: postgres" not in template
+    assert "LAKEBASE_INSTANCE" not in template
+    import re
+
+    others = {m[2:-2]: "" for m in re.findall(r"__[A-Z0-9_]+__", template)}
+    rendered = render_text(template, {**others, "WORKBENCH_STATE_CATALOG": "ops", "WORKBENCH_STATE_SCHEMA": "wb"})
+    env = {e["name"]: e.get("value") for e in yaml.safe_load(rendered)["env"] if "name" in e}
+    assert env["WORKBENCH_STATE_CATALOG"] == "ops"
+    assert env["WORKBENCH_STATE_SCHEMA"] == "wb"
+    assert "WORKSPACES_SECRET_SCOPE" in env and env["WORKSPACES_SECRET_SCOPE"] == ""
 
 
 # Spec 11.9: the upgrade mirrors today's process (Pull, Run all); no upgrade switch.
@@ -2087,3 +1953,59 @@ def test_release_check_docs_say_the_answer_applies_to_everyone():
     section = guide.split("\n## Release update check\n", 1)[1].split("\n## ", 1)[0]
     assert "anyone who opens the Admin tab sees a one-time banner until someone answers" in section
     assert "the first person" not in section
+
+
+# Cross-workspace secret scope (grant_permissions.py), best-effort and never fatal.
+def _load_grant_permissions():
+    import importlib
+
+    return importlib.import_module("scripts.grant_permissions")
+
+
+def test_grant_permissions_creates_the_scope_and_grants_manage_to_the_app_sp(monkeypatch):
+    gp = _load_grant_permissions()
+    cli = []
+
+    def fake_run(cmd):
+        cli.append(cmd)
+        if cmd[:3] == ["databricks", "secrets", "list-scopes"]:
+            return "[]"
+        return ""
+
+    monkeypatch.setattr(gp, "_run", fake_run)
+    gp._ensure_workspaces_secret_scope(profile="P", scope="genie-workbench-workspaces", principal="sp-id")
+    assert ["databricks", "secrets", "create-scope", "genie-workbench-workspaces", "--profile", "P"] in cli
+    assert [
+        "databricks", "secrets", "put-acl", "genie-workbench-workspaces", "sp-id", "MANAGE", "--profile", "P",
+    ] in cli
+
+
+def test_grant_permissions_reuses_an_existing_scope_and_never_fails(monkeypatch, capsys):
+    gp = _load_grant_permissions()
+    cli = []
+
+    def fake_run(cmd):
+        cli.append(cmd)
+        if cmd[:3] == ["databricks", "secrets", "list-scopes"]:
+            return '[{"name": "genie-workbench-workspaces"}]'
+        return ""
+
+    monkeypatch.setattr(gp, "_run", fake_run)
+    gp._ensure_workspaces_secret_scope(profile="P", scope="genie-workbench-workspaces", principal="sp-id")
+    assert not any(cmd[:3] == ["databricks", "secrets", "create-scope"] for cmd in cli)
+    assert any(cmd[:3] == ["databricks", "secrets", "put-acl"] for cmd in cli)
+
+    def boom(cmd):
+        raise RuntimeError("PERMISSION_DENIED")
+
+    monkeypatch.setattr(gp, "_run", boom)
+    gp._ensure_workspaces_secret_scope(profile="P", scope="s", principal="sp-id")  # must not raise
+    assert "WARNING: could not set up cross-workspace secret scope" in capsys.readouterr().err
+
+
+def test_grant_permissions_scope_defaults_and_deploy_passes_it_through():
+    gp = _load_grant_permissions()
+    assert gp.DEFAULT_WORKSPACES_SECRET_SCOPE == "genie-workbench-workspaces"
+    deploy_sh = Path("scripts/deploy.sh").read_text()
+    assert '--workspaces-secret-scope "$WORKSPACES_SECRET_SCOPE"' in deploy_sh
+    assert "setup_lakebase" not in deploy_sh and "LAKEBASE_INSTANCE" not in deploy_sh

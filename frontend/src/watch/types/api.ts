@@ -191,7 +191,7 @@ export interface WorkspaceOverview {
 }
 
 export interface HealthStatus {
-  lakebase_available: boolean
+  storage_available: boolean
   obo_active: boolean
   warehouse_id: string | null
   workspace_host: string | null

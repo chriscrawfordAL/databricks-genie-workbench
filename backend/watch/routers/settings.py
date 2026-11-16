@@ -7,7 +7,7 @@ import os
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
-from backend.services import lakebase
+from backend.services import state_store
 from backend.services.auth import get_databricks_host
 from backend.watch.models import HealthStatus
 from backend.watch.services import (
@@ -27,7 +27,7 @@ async def health() -> dict:
     except Exception:
         host = None
     return HealthStatus(
-        lakebase_available=lakebase.is_available(),
+        storage_available=state_store.is_available(),
         obo_active=False,
         warehouse_id=os.environ.get("SQL_WAREHOUSE_ID"),
         workspace_host=host,

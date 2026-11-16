@@ -3,7 +3,7 @@
 #
 # Genie Workbench combines:
 #   - GenieRx: LLM-powered analysis and optimization of Genie Agents
-#   - GenieIQ: Org-wide scoring with PostgreSQL (Lakebase) persistence
+#   - GenieIQ: Org-wide scoring with Delta-table persistence
 #
 # Authentication: User-based (OBO) — users can only access Genie Agents
 # they have permission to manage.
@@ -153,19 +153,23 @@ env:
     value: ""
 
   # ---------------------------------------------------------------------------
-  # Lakebase PostgreSQL — connect manually via Databricks Apps UI.
-  # Add a postgres resource named "postgres" in the Apps UI. The platform
-  # injects the host via valueFrom. The app auto-creates all required tables.
-  # Without Lakebase, the app uses in-memory storage (ephemeral).
+  # Workbench state (Delta tables — no Lakebase)
+  # The app keeps its own state in <catalog>.<schema>.workbench_state. Leave
+  # these empty to have a workspace admin choose the location in the app's
+  # first-run Setup dialog; deploy.sh fills them from GENIE_STATE_CATALOG /
+  # GENIE_STATE_SCHEMA when set.
   # ---------------------------------------------------------------------------
-  - name: LAKEBASE_HOST
-    valueFrom: postgres
-  - name: LAKEBASE_PORT
-    value: "5432"
-  - name: LAKEBASE_DATABASE
-    value: "databricks_postgres"
-  - name: LAKEBASE_INSTANCE_NAME
-    value: "__LAKEBASE_INSTANCE__"
+  - name: WORKBENCH_STATE_CATALOG
+    value: "__WORKBENCH_STATE_CATALOG__"
+  - name: WORKBENCH_STATE_SCHEMA
+    value: "__WORKBENCH_STATE_SCHEMA__"
+
+  # ---------------------------------------------------------------------------
+  # Cross-workspace: secret scope (home workspace) holding the client secrets of
+  # service principals registered for remote workspaces in the same account.
+  # ---------------------------------------------------------------------------
+  - name: WORKSPACES_SECRET_SCOPE
+    value: "__WORKSPACES_SECRET_SCOPE__"
 
   # ---------------------------------------------------------------------------
   # Auto-Optimize (GSO Engine)

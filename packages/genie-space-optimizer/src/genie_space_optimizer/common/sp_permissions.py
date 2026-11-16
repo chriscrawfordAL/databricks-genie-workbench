@@ -24,6 +24,17 @@ _ALL_PRIV = Privilege.ALL_PRIVILEGES
 
 def _get_sp_client_id(ws: WorkspaceClient) -> str:
     """Return the SP's client_id from config or environment."""
+    from genie_space_optimizer.common.agent_target import (
+        agent_client,
+        current_agent_target,
+        remote_active,
+    )
+
+    # The remote agent client authenticates via a custom strategy, so its config
+    # has no client_id; never fall back to the HOME SP id from the environment.
+    if remote_active() and ws is agent_client(None):
+        target = current_agent_target()
+        return target.client_id if target else ""
     return ws.config.client_id or os.getenv("DATABRICKS_CLIENT_ID", "")
 
 
@@ -115,6 +126,8 @@ def _probe_sp_access(
     A schema is ``unknown`` when it is not read-granted and a grants read
     for its catalog or for the schema itself raised.
     """
+    from genie_space_optimizer.common.agent_target import agent_client
+    sp_ws = agent_client(sp_ws)
     if not schemas:
         return set(), set(), set()
 

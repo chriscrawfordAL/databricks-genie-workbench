@@ -73,6 +73,10 @@ resources:
           default: ""
         - name: workload_warehouse_ids
           default: "[]"
+        # Cross-workspace agent target (JSON AgentTarget; empty = home workspace).
+        # Carries a secret-scope REFERENCE for the remote SP, never the secret.
+        - name: target
+          default: ""
         # Metric view advisor parameters (MV-D5 four-place lockstep). Only the
         # optimize task consumes them (run_optimize.py). enable_metric_view_suggestions
         # gates the advisor phase; mv_attach_views / mv_consent_id drive the MV-D16
@@ -110,6 +114,7 @@ resources:
               benchmark_policy: "{{job.parameters.benchmark_policy}}"
               triggered_by: "{{job.parameters.triggered_by}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              target: "{{job.parameters.target}}"
               workload_warehouse_ids: "{{job.parameters.workload_warehouse_ids}}"
           environment_key: default
           timeout_seconds: 14400
@@ -129,6 +134,7 @@ resources:
               benchmark_repair_max_tries: "{{job.parameters.benchmark_repair_max_tries}}"
               benchmark_policy: "{{job.parameters.benchmark_policy}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              target: "{{job.parameters.target}}"
           environment_key: default
           timeout_seconds: 14400
           max_retries: 0
@@ -149,6 +155,7 @@ resources:
               target_accuracy: "{{job.parameters.target_accuracy}}"
               benchmark_policy: "{{job.parameters.benchmark_policy}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              target: "{{job.parameters.target}}"
               # Metric view advisor phase inputs (MV-D5). Passing these as
               # base_parameters is what makes the run_optimize.py widgets receive
               # real job values — a declared job parameter omitted here silently
@@ -177,6 +184,7 @@ resources:
               max_attempts: "{{job.parameters.max_attempts}}"
               benchmark_policy: "{{job.parameters.benchmark_policy}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              target: "{{job.parameters.target}}"
           environment_key: default
           timeout_seconds: 14400
           max_retries: 0

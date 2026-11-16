@@ -111,6 +111,9 @@ def trigger_optimization(
     mv_attach_hook: Callable[[str], Any] | None = None,
     proposed_join_seeds: list[dict] | None = None,
     operator_guidance: str | None = None,
+    agent_ws: WorkspaceClient | None = None,
+    target: dict | None = None,
+    agent_sp_aliases: list[str] | None = None,
 ) -> TriggerResult:
     """Trigger a GSO optimization run using SQL Warehouse for state management.
 
@@ -121,6 +124,17 @@ def trigger_optimization(
         space_id: The Genie Agent ID to optimize.
         ws: OBO-authenticated ``WorkspaceClient`` for the requesting user.
         sp_ws: Service-principal ``WorkspaceClient`` for job submission.
+        agent_ws: Cross-workspace only — a client for the workspace the Genie
+            Agent lives in (another metastore). Used for every agent-side read
+            (config snapshot, UC metadata prefetch, CAN_MANAGE + grant checks);
+            GSO state and job submission stay on ``ws``/``sp_ws`` (home). The
+            per-user edit check is skipped (no cross-workspace user identity;
+            the caller admin-gates instead).
+        target: Cross-workspace only — the ``AgentTarget`` fields (secret-scope
+            reference, never a secret) forwarded to the job as ``target``.
+        agent_sp_aliases: Principal aliases of the remote service principal
+            for the CAN_MANAGE check (defaults to the target's client id plus
+            whatever ``agent_ws`` resolves for itself).
         config: Integration configuration (catalog, schema, warehouse, etc.).
         user_email: Email of the requesting user (for audit trail).
         user_name: Display name fallback when email is unavailable.
@@ -186,7 +200,17 @@ def trigger_optimization(
             "Provide user_email or user_name."
         )
 
-    if not user_can_edit_space(ws, space_id):
+    agent_target_json = ""
+    agent_target_obj = None
+    if agent_ws is not None or target:
+        if agent_ws is None or not target:
+            raise ValueError("A cross-workspace optimization needs both agent_ws and target.")
+        from genie_space_optimizer.common.agent_target import AgentTarget
+
+        agent_target_obj = AgentTarget.from_dict(target)
+        agent_target_json = agent_target_obj.to_json()
+
+    if agent_ws is None and not user_can_edit_space(ws, space_id):
         raise PermissionError(
             "You need CAN_EDIT or CAN_MANAGE permission on this "
             "Genie Agent to start optimization."
@@ -233,7 +257,10 @@ def trigger_optimization(
 
     run_id = str(uuid.uuid4())
 
-    space_snapshot = _capture_config_snapshot(space_id=space_id, ws=ws, sp_ws=sp_ws)
+    if agent_ws is not None:
+        space_snapshot = _capture_config_snapshot(space_id=space_id, ws=agent_ws, sp_ws=agent_ws)
+    else:
+        space_snapshot = _capture_config_snapshot(space_id=space_id, ws=ws, sp_ws=sp_ws)
 
     title = str(space_snapshot.get("title", "") or "")
     domain = (
@@ -248,13 +275,29 @@ def trigger_optimization(
     try:
         from genie_space_optimizer.integration.uc_metadata import fetch_uc_metadata_obo
 
-        obo_uc_metadata = fetch_uc_metadata_obo(
-            ws,
-            warehouse_id=config.warehouse_id,
-            catalog=config.catalog,
-            schema_name=config.schema_name,
-            genie_table_refs=genie_refs or None,
-        )
+        if agent_ws is not None:
+            # The agent's tables live in the remote metastore: prefetch there,
+            # on a remote warehouse, for the agent's own table refs only.
+            obo_uc_metadata = {}
+            if genie_refs:
+                from genie_space_optimizer.common.agent_target import resolve_agent_warehouse
+
+                remote_wh = resolve_agent_warehouse(agent_ws, agent_target_obj)
+                obo_uc_metadata = fetch_uc_metadata_obo(
+                    agent_ws,
+                    warehouse_id=remote_wh,
+                    catalog="",
+                    schema_name="",
+                    genie_table_refs=genie_refs,
+                )
+        else:
+            obo_uc_metadata = fetch_uc_metadata_obo(
+                ws,
+                warehouse_id=config.warehouse_id,
+                catalog=config.catalog,
+                schema_name=config.schema_name,
+                genie_table_refs=genie_refs or None,
+            )
         if space_snapshot and obo_uc_metadata:
             space_snapshot["_prefetched_uc_metadata"] = obo_uc_metadata
     except Exception:
@@ -262,8 +305,19 @@ def trigger_optimization(
 
     from genie_space_optimizer.common.sp_permissions import get_sp_principal_aliases
 
-    sp_aliases = get_sp_principal_aliases(sp_ws)
-    if not sp_can_manage_space(sp_ws, space_id, sp_aliases):
+    if agent_ws is not None:
+        sp_aliases = {a.lower() for a in (agent_sp_aliases or []) if a}
+        if agent_target_obj is not None:
+            sp_aliases.add(agent_target_obj.client_id.lower())
+        try:
+            sp_aliases |= get_sp_principal_aliases(agent_ws)
+        except Exception:  # noqa: BLE001 - explicit aliases still apply
+            logger.debug("Could not resolve remote SP aliases", exc_info=True)
+        perm_ws = agent_ws
+    else:
+        sp_aliases = get_sp_principal_aliases(sp_ws)
+        perm_ws = sp_ws
+    if not sp_can_manage_space(perm_ws, space_id, sp_aliases):
         raise PermissionError(
             f"The service principal does not have CAN_MANAGE on Genie Agent {space_id}."
         )
@@ -276,7 +330,7 @@ def trigger_optimization(
         from genie_space_optimizer.common.uc_metadata import get_unique_schemas
 
         missing_schemas, unknown_schemas = missing_read_schemas(
-            sp_ws, set(get_unique_schemas(genie_refs)),
+            perm_ws, set(get_unique_schemas(genie_refs)),
         )
         if unknown_schemas:
             logger.warning(
@@ -435,6 +489,7 @@ def trigger_optimization(
             mv_min_confidence=(
                 str(int(mv_min_confidence)) if mv_min_confidence is not None else "75"
             ),
+            target=agent_target_json or None,
         )
     except Exception as exc:
         logger.exception("Job submission failed for run %s", run_id)

@@ -88,6 +88,8 @@ def submit_optimization(
     mv_attach_views: str = "",
     mv_consent_id: str = "",
     mv_min_confidence: str = "75",
+    # Cross-workspace agent target (AgentTarget JSON; None/"" = home workspace).
+    target: str | None = None,
 ) -> tuple[str, int]:
     """Trigger a run on the bundle-managed optimization job.
 
@@ -141,6 +143,8 @@ def submit_optimization(
                 "mv_attach_views": mv_attach_views,
                 "mv_consent_id": mv_consent_id,
                 "mv_min_confidence": mv_min_confidence,
+                # Cross-workspace agent target (see common/agent_target.py).
+                "target": target or "",
             },
         )
 

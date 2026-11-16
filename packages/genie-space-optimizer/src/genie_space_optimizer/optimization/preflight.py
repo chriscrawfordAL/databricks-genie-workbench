@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import mlflow
 
+from genie_space_optimizer.common.agent_target import agent_client, remote_active
 from genie_space_optimizer.common.config import (
     BENCHMARK_WINDOW_MAX,
     BENCHMARK_WINDOW_MIN,
@@ -121,6 +122,8 @@ def check_dim_date_staleness(
     dict with keys ``status`` (``ok``/``stale``/``missing``/``error``),
     ``max_current_year_date``, ``days_behind``, and ``message``.
     """
+    if remote_active():
+        return {"status": "error", "max_current_year_date": None, "days_behind": None, "message": "skipped: agent lives in a remote workspace"}
     fqn = f"{catalog}.{schema}.{table}"
     try:
         row = spark.sql(
@@ -882,6 +885,7 @@ def _validate_core_access(
     ``information_schema`` queries which have a hidden dependency on the
     ``system`` catalog.
     """
+    w = agent_client(w)
     schema_sample: dict[tuple[str, str], str] = {}
     for ref in genie_table_refs:
         cat = ref[0] if isinstance(ref, (list, tuple)) else ""
@@ -933,6 +937,9 @@ def _validate_core_access(
 
 def _validate_write_access(spark: SparkSession, genie_table_refs: list) -> None:
     """Fail-fast if the runtime identity lacks MODIFY on schemas required for UC writes."""
+    if remote_active():
+        logger.info("Skipping Spark SHOW GRANTS write-access probe: agent lives in a remote workspace")
+        return
     schemas: set[tuple[str, str]] = set()
     for ref in genie_table_refs:
         cat = ref[0] if isinstance(ref, (list, tuple)) else ""

@@ -454,7 +454,10 @@ def collect_inventory(
         ref for ref in refs
         if tuple(normalize_component(value) for value in ref) not in covered_refs
     ]
-    if missing_refs:
+    from genie_space_optimizer.common.agent_target import remote_active
+
+    # A remote agent's tables are not in the home metastore: no Spark fallback.
+    if missing_refs and not remote_active():
         frame = get_columns_for_tables(spark, missing_refs)
         fallback_rows = [row.asDict(recursive=True) for row in frame.collect()]
         existing_columns = {
@@ -497,7 +500,7 @@ def collect_inventory(
         foreign_keys = get_foreign_keys_for_tables_rest(w, refs)
     except Exception:
         foreign_keys = []
-    if not foreign_keys:
+    if not foreign_keys and not remote_active():
         foreign_keys = get_foreign_keys_for_tables(spark, refs)
 
     try:

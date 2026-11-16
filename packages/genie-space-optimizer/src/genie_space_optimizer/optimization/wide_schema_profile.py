@@ -566,6 +566,8 @@ def run_bounded_profile(
     budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute the bounded profiling stage and return profile/outcome telemetry."""
+    from genie_space_optimizer.common.agent_target import agent_sql
+    w, warehouse_id = agent_sql(w, warehouse_id)
     started = time.monotonic()
     budget = budget if isinstance(budget, dict) else build_profiling_budget()
     prior_submitted = max(0, int(budget.get("submitted_statements") or 0))

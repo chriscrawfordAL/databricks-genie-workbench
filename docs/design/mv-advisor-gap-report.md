@@ -525,8 +525,8 @@ src/genie_space_optimizer/
   integration/    trigger.py, apply.py, discard.py, revert.py, levers.py, types.py
   iq_scan/        scoring.py, context.py, rls_audit.py
   jobs/           the four notebooks + _helpers.py
-  optimization/   applier.py (4817 L), benchmarking.py (4594 L), unified_loop.py (3955 L),
-                  preflight.py (3461 L), state.py (1871 L), publish.py, ddl.py,
+  optimization/   applier.py (4820 L), benchmarking.py (4613 L), unified_loop.py (3955 L),
+                  preflight.py (3468 L), state.py (1871 L), publish.py, ddl.py,
                   eval_runner.py, leakage.py, models.py, champion.py,
                   wide_schema*.py, genie_eval_taxonomy.py,
                   mv_fingerprint.py (1798 L), mv_scoring.py (1706 L),
@@ -538,7 +538,7 @@ src/genie_space_optimizer/
 
 | Module | Role |
 |---|---|
-| `common/metric_view_catalog.py` (690 L) | `detect_metric_views_via_catalog_with_outcomes(...)` / `detect_metric_views_via_catalog(...)` / `summarize_outcomes(...)` — DESCRIBE-based MV detection and YAML extraction |
+| `common/metric_view_catalog.py` (692 L) | `detect_metric_views_via_catalog_with_outcomes(...)` / `detect_metric_views_via_catalog(...)` / `summarize_outcomes(...)` — DESCRIBE-based MV detection and YAML extraction |
 | `common/asset_semantics.py` | `is_metric_view`, table/MV shelf split, measure maps |
 | `optimization/preflight.py` | `_profile_metric_view`, reclassification into `_metric_view_yaml` |
 | `optimization/benchmarking.py` | MV join precheck/repair, `MEASURE()` wrapping, `build_metric_view_measures` |

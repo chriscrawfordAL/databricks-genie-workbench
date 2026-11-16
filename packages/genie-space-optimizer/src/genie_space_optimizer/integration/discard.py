@@ -30,8 +30,14 @@ def discard_optimization(
     ws: WorkspaceClient,
     sp_ws: WorkspaceClient,
     config: IntegrationConfig,
+    *,
+    agent_ws: WorkspaceClient | None = None,
 ) -> ActionResult:
     """Discard an optimization run and rollback config.  Needs OBO + SP.
+
+    ``agent_ws`` (cross-workspace only) is a client for the workspace the Genie
+    Agent lives in; it performs the rollback and the per-user edit check is
+    skipped (the caller admin-gates). Run state stays home.
 
     Uses SQL Warehouse for Delta state reads/writes.
     Rollback uses the Genie REST API (no Spark needed).
@@ -72,7 +78,7 @@ def discard_optimization(
         raise ValueError("Run has no space_id; cannot roll back the Genie Agent.")
     from genie_space_optimizer.common.genie_client import user_can_edit_space
 
-    if not user_can_edit_space(ws, str(space_id)):
+    if agent_ws is None and not user_can_edit_space(ws, str(space_id)):
         raise PermissionError(
             "You need CAN_EDIT or CAN_MANAGE permission on this Genie Agent "
             "to discard optimization changes."
@@ -100,7 +106,7 @@ def discard_optimization(
     from genie_space_optimizer.optimization.applier import rollback
 
     apply_log = {"pre_snapshot": original_snapshot}
-    client = _pick_genie_client(ws, sp_ws)
+    client = agent_ws if agent_ws is not None else _pick_genie_client(ws, sp_ws)
     rollback_result = rollback(apply_log, client, space_id)
     if str(rollback_result.get("status") or "").upper() != "SUCCESS":
         errors = rollback_result.get("errors") or ["unknown rollback failure"]

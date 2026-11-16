@@ -91,6 +91,7 @@ dbutils.widgets.text("benchmark_repair_max_tries", "3")
 dbutils.widgets.text("benchmark_policy", "repair_allowed")
 dbutils.widgets.text("triggered_by", "")
 dbutils.widgets.text("warehouse_id", "")
+dbutils.widgets.text("target", "")  # cross-workspace agent target (JSON; empty = home)
 dbutils.widgets.text("llm_model", "")
 dbutils.widgets.text("genie_llm_route", "")
 dbutils.widgets.text("workload_warehouse_ids", "[]")
@@ -159,6 +160,17 @@ configure_connection_pool(w, CONNECTION_POOL_SIZE)
 configure_mlflow_connection_pool(CONNECTION_POOL_SIZE)
 
 warehouse_id = resolve_warehouse_id(dbutils.widgets.get("warehouse_id").strip())
+
+# Cross-workspace: when the Genie Agent lives in another workspace (separate
+# metastore), Genie API calls and agent-data SQL go to that workspace's
+# client + warehouse; LLM calls, GSO state and MLflow stay here (home).
+from genie_space_optimizer.common.agent_target import configure_agent_target_from_param
+_agent_target = configure_agent_target_from_param(w, dbutils.widgets.get("target"))
+print(
+    "[GSO] Agent workspace: "
+    + (f"remote {_agent_target.host} (connection {_agent_target.workspace_id})" if _agent_target else "home"),
+    flush=True,
+)
 if warehouse_id:
     export_warehouse_id(warehouse_id)
 _log("SQL warehouse", warehouse_id=warehouse_id or "(not set — using Spark SQL)")

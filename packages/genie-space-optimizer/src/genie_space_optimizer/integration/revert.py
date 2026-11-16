@@ -60,6 +60,7 @@ def revert_optimization(
     *,
     target: RevertTarget = "champion",
     benchmark_target: BenchmarkRevertTarget = "current",
+    agent_ws: WorkspaceClient | None = None,
 ) -> ActionResult:
     """Revert the live Genie Agent to a past run's captured configuration.
 
@@ -75,6 +76,9 @@ def revert_optimization(
             ``"champion"`` restores the winning iteration's benchmark block;
             ``"baseline"`` restores the pre-run benchmark block independently
             of the selected agent configuration target.
+        agent_ws: Cross-workspace only — client for the workspace the Genie
+            Agent lives in. Used for every Genie read/patch; the per-user edit
+            check is skipped (the caller admin-gates). Run state stays home.
 
     Returns:
         :class:`ActionResult` with status ``"reverted"``.
@@ -109,7 +113,7 @@ def revert_optimization(
 
     from genie_space_optimizer.common.genie_client import user_can_edit_space
 
-    if not user_can_edit_space(ws, space_id):
+    if agent_ws is None and not user_can_edit_space(ws, space_id):
         raise PermissionError(
             "You need CAN_EDIT or CAN_MANAGE permission on this Genie Agent "
             "to revert its configuration."
@@ -162,11 +166,16 @@ def revert_optimization(
     if not target_config or not isinstance(target_config, dict):
         raise ValueError(missing_hint)
 
-    preferred_client = _pick_genie_client(ws, sp_ws)
-    live_snapshot, client = _fetch_live_space_snapshot(
-        space_id=space_id,
-        clients=(preferred_client, ws, sp_ws),
-    )
+    if agent_ws is not None:
+        live_snapshot, client = _fetch_live_space_snapshot(
+            space_id=space_id, clients=(agent_ws,),
+        )
+    else:
+        preferred_client = _pick_genie_client(ws, sp_ws)
+        live_snapshot, client = _fetch_live_space_snapshot(
+            space_id=space_id,
+            clients=(preferred_client, ws, sp_ws),
+        )
     live_config = _as_serialized_space_config(live_snapshot)
     if not live_config:
         raise RuntimeError(
@@ -365,8 +374,14 @@ def preview_revert_options(
     ws: WorkspaceClient,
     sp_ws: WorkspaceClient,
     config: IntegrationConfig,
+    *,
+    agent_ws: WorkspaceClient | None = None,
 ) -> dict:
-    """Return target availability and live-to-snapshot benchmark diffs."""
+    """Return target availability and live-to-snapshot benchmark diffs.
+
+    ``agent_ws`` (cross-workspace only) reads the live agent from its own
+    workspace and skips the per-user edit check.
+    """
     run_data = wh_load_run(
         sp_ws, config.warehouse_id, run_id, config.catalog, config.schema_name,
     )
@@ -382,7 +397,7 @@ def preview_revert_options(
         raise ValueError("Run has no space_id; cannot preview revert options.")
     from genie_space_optimizer.common.genie_client import user_can_edit_space
 
-    if not user_can_edit_space(ws, space_id):
+    if agent_ws is None and not user_can_edit_space(ws, space_id):
         raise PermissionError(
             "You need CAN_EDIT or CAN_MANAGE permission on this Genie Agent "
             "to preview revert options."
@@ -397,11 +412,14 @@ def preview_revert_options(
         config.schema_name,
         run_id,
     ))
-    preferred_client = _pick_genie_client(ws, sp_ws)
-    live_snapshot, _ = _fetch_live_space_snapshot(
-        space_id=space_id,
-        clients=(preferred_client, ws, sp_ws),
-    )
+    if agent_ws is not None:
+        live_snapshot, _ = _fetch_live_space_snapshot(space_id=space_id, clients=(agent_ws,))
+    else:
+        preferred_client = _pick_genie_client(ws, sp_ws)
+        live_snapshot, _ = _fetch_live_space_snapshot(
+            space_id=space_id,
+            clients=(preferred_client, ws, sp_ws),
+        )
     live_config = _as_serialized_space_config(live_snapshot) or {}
     champion_diff = _benchmark_restore_diff(live_config, champion_config or {})
     baseline_diff = _benchmark_restore_diff(live_config, baseline_config or {})

@@ -26,6 +26,7 @@ from databricks.sdk.errors.platform import (
     Unauthenticated,
 )
 
+from .agent_target import agent_client
 from .config import (
     BENCHMARK_WINDOW_MAX,
     BENCHMARK_WINDOW_MIN,
@@ -148,6 +149,7 @@ def list_spaces(w: WorkspaceClient) -> list[dict[str, str]]:
 
     Returns a list of ``{"id": ..., "title": ...}`` dicts.
     """
+    w = agent_client(w)
     all_spaces: list[dict[str, str]] = []
     page_token: str | None = None
     while True:
@@ -202,6 +204,7 @@ def check_space_access(
     permissions API answers only CAN MANAGE holders). Pass the user's own client:
     the answer belongs to whoever *w* authenticates as.
     """
+    w = agent_client(w)
     level = SpaceAccessLevel(level)
     if level is SpaceAccessLevel.MANAGE:
         path, query = f"/api/2.0/permissions/genie/{space_id}", None
@@ -261,6 +264,7 @@ def get_space_permissions_rest(w: WorkspaceClient, space_id: str) -> dict | None
     Prefer this over ``permissions.get()`` SDK which requires specific
     OAuth scopes that OBO tokens may lack.
     """
+    w = agent_client(w)
     try:
         resp = w.api_client.do("GET", f"/api/2.0/permissions/genie/{space_id}")
         return resp if isinstance(resp, dict) else None
@@ -333,6 +337,7 @@ def fetch_space_config(w: WorkspaceClient, space_id: str) -> dict:
         MissingSerializedSpaceError: if Genie returns a 200 response without
             the requested ``serialized_space`` export, or with an empty export.
     """
+    w = agent_client(w)
     raw_config = w.api_client.do(
         "GET",
         f"/api/2.0/genie/spaces/{space_id}",
@@ -445,6 +450,7 @@ def run_genie_query(
     Retries with exponential backoff on ``ResourceExhausted`` (HTTP 429)
     and ``TimeoutError`` from the SDK's own retry layer.
     """
+    w = agent_client(w)
     for rate_attempt in range(GENIE_RATE_LIMIT_RETRIES + 1):
         try:
             resp = w.genie.start_conversation(space_id=space_id, content=question)
@@ -559,6 +565,7 @@ def fetch_genie_result_df(
     still ``PENDING``/``RUNNING`` or when results are transiently unavailable.
     Returns ``None`` if the result cannot be retrieved after all attempts.
     """
+    w = agent_client(w)
     import pandas as pd
 
     for attempt in range(max_retries):
@@ -871,6 +878,7 @@ def patch_space_config(
     structure before sending.  Retries on transient HTTP errors (429, 5xx).
     Returns the raw API response.
     """
+    w = agent_client(w)
     from .genie_schema import normalize_array_fields, validate_serialized_space
 
     clean = strip_non_exportable_fields(_serialized_space_for_patch(config))
@@ -944,6 +952,7 @@ def update_space_description(
     inside ``serialized_space``.  This sends a minimal PATCH with just
     ``{"description": "..."}`` to avoid coupling with config updates.
     """
+    w = agent_client(w)
     payload = {"description": description}
     logger.info(
         "PATCHing Genie Agent %s description (%d chars)", space_id, len(description),
@@ -1468,6 +1477,7 @@ def publish_benchmarks_to_genie_space_with_report(
     ``publish_benchmarks_to_genie_space`` is the thin int-returning wrapper
     kept for backward compatibility.
     """
+    w = agent_client(w)
     config = fetch_space_config(w, space_id)
     parsed = config.get("_parsed_space", {})
     if not isinstance(parsed, dict):

@@ -9,6 +9,7 @@ import re as _re
 from contextlib import contextmanager
 from typing import Any
 
+from genie_space_optimizer.common.agent_target import agent_sql
 from genie_space_optimizer.common.config import MAX_BENCHMARK_COUNT, TEMPLATE_VARIABLES
 from genie_space_optimizer.common.delta_helpers import retry_delta_write
 from genie_space_optimizer.common.genie_client import detect_asset_type
@@ -322,6 +323,7 @@ def _verify_table_exists(
     When *w* and *warehouse_id* are provided, routes the check through the
     SQL warehouse Statement Execution API; otherwise uses Spark SQL.
     """
+    w, warehouse_id = agent_sql(w, warehouse_id)
     if is_tvf:
         return True, ""
     try:
@@ -426,6 +428,7 @@ def validate_ground_truth_sql(
 
     Returns ``(is_valid, error_message)``.
     """
+    w, warehouse_id = agent_sql(w, warehouse_id)
     resolved = resolve_sql(sql, catalog=catalog, gold_schema=gold_schema)
     if not resolved or not resolved.strip():
         return False, "Empty SQL"
@@ -967,6 +970,7 @@ def validate_gt_returns_results(
 
     Returns a list of ``{question, has_results, row_count, error}`` dicts.
     """
+    w, warehouse_id = agent_sql(w, warehouse_id)
     from genie_space_optimizer.optimization.benchmarking import _exec_sql
 
     _sql_kw: dict[str, Any] = dict(w=w, warehouse_id=warehouse_id, catalog=catalog, schema=schema)
@@ -1713,6 +1717,7 @@ def normalize_sql_snippet(
     error is added to ``warnings`` but the normalized SQL is still
     returned so the caller can decide whether to store it anyway.
     """
+    w, warehouse_id = agent_sql(w, warehouse_id)
     warnings: list[str] = []
     if not sql or not isinstance(sql, str):
         return sql, warnings
@@ -1882,6 +1887,7 @@ def validate_sql_snippet(
     use ``prefixed_sql`` (the 3rd element) when storing the snippet so
     the FQ form is persisted.
     """
+    w, warehouse_id = agent_sql(w, warehouse_id)
     from genie_space_optimizer.common.config import REJECT_VACUOUS_FILTERS
 
     table = _primary_table_for_snippet(

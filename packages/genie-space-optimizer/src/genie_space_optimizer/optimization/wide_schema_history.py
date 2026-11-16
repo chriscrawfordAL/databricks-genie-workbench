@@ -268,6 +268,8 @@ def _system_history_rows(
     service_principal_identities: Iterable[str] = (),
     lookback_days: int = HISTORY_LOOKBACK_DAYS,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    from genie_space_optimizer.common.agent_target import agent_sql
+    w, warehouse_id = agent_sql(w, warehouse_id)
     from databricks.sdk.service.sql import Disposition, Format, StatementState
 
     try:
@@ -327,6 +329,8 @@ def _rest_history_rows(
     w: Any,
     workload_warehouse_ids: list[str],
 ) -> tuple[list[dict[str, Any]], list[str]]:
+    from genie_space_optimizer.common.agent_target import agent_client
+    w = agent_client(w)
     from databricks.sdk.service.sql import QueryFilter, QueryStatus, TimeRange
 
     now_ms = int(time.time() * 1000)
@@ -714,11 +718,14 @@ def collect_query_history_evidence(
 ) -> dict[str, Any]:
     """Collect relevant history, expanding/falling back when evidence is empty."""
     job_id = str(gso_job_id or os.getenv("GSO_JOB_ID", ""))
-    identities = sorted(
+    from genie_space_optimizer.common.agent_target import current_agent_target
+
+    _remote = current_agent_target()
+    identities = sorted({
         str(value).casefold()
-        for value in service_principal_identities
+        for value in [*service_principal_identities, *([_remote.client_id] if _remote else [])]
         if value
-    )
+    })
     warehouses = list(dict.fromkeys(workload_warehouse_ids or []))
     cache_key = content_hash({
         "inventory_hash": inventory.get("inventory_hash"),

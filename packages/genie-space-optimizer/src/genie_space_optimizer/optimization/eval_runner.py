@@ -476,7 +476,9 @@ class OfficialBenchmarkRunner:
         sleep: Callable[[float], None] = time.sleep,
         progress: Callable[[str, dict], None] | None = None,
     ) -> None:
-        self._genie = w.genie
+        from genie_space_optimizer.common.agent_target import agent_client
+
+        self._genie = agent_client(w).genie
         self._poll_interval = float(
             poll_interval_seconds
             if poll_interval_seconds is not None

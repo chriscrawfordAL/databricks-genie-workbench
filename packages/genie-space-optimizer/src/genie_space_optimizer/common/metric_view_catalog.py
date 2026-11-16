@@ -107,6 +107,8 @@ def detect_metric_views_via_catalog_with_outcomes(
     without a structural signal still records ``not_mv_shape`` /
     ``no_view_text`` rather than classifying by name alone.
     """
+    from genie_space_optimizer.common.agent_target import agent_sql
+    w, warehouse_id = agent_sql(w, warehouse_id)
     import json as _json
 
     import yaml as _yaml

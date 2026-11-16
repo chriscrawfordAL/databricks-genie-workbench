@@ -161,6 +161,8 @@ def warehouse_reader(ws: WorkspaceClient, warehouse_id: str) -> RunQuery:
     their tests — never depend on pandas. Import is local so this module carries
     no import-time dependency on the SDK or pandas.
     """
+    from genie_space_optimizer.common.agent_target import agent_sql
+    ws, warehouse_id = agent_sql(ws, warehouse_id)
     from genie_space_optimizer.common.warehouse import sql_warehouse_query
 
     def _run(sql: str) -> Sequence[Mapping[str, Any]]:

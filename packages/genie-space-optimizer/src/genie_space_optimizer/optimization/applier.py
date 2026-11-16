@@ -4023,7 +4023,10 @@ def _apply_action_to_uc(w: WorkspaceClient, action: dict) -> bool:
         return False
 
     patch_type = action.get("action_type", "")
-    warehouse_id = os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", "").strip()
+    from genie_space_optimizer.common.agent_target import agent_sql
+
+    # UC DDL targets the agent's own tables — run it in the agent's workspace.
+    w, warehouse_id = agent_sql(w, os.getenv("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID", "").strip())
     if not warehouse_id:
         logger.warning("GENIE_SPACE_OPTIMIZER_WAREHOUSE_ID is not set; skipping UC DDL action")
         return False

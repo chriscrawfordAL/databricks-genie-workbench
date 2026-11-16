@@ -107,6 +107,10 @@ resources:
           default: ""
         - name: workload_warehouse_ids
           default: "[]"
+        # Cross-workspace agent target (JSON AgentTarget; empty = home workspace).
+        # Carries a secret-scope REFERENCE for the remote SP, never the secret.
+        - name: target
+          default: ""
         - name: llm_model
           default: ${var.llm_model}
         # AI Gateway route (spec §4). Workbench-only extra, like llm_model:
@@ -153,6 +157,7 @@ resources:
               benchmark_policy: "{{job.parameters.benchmark_policy}}"
               triggered_by: "{{job.parameters.triggered_by}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              target: "{{job.parameters.target}}"
               workload_warehouse_ids: "{{job.parameters.workload_warehouse_ids}}"
               llm_model: "{{job.parameters.llm_model}}"
               genie_llm_route: "{{job.parameters.genie_llm_route}}"
@@ -174,6 +179,7 @@ resources:
               benchmark_repair_max_tries: "{{job.parameters.benchmark_repair_max_tries}}"
               benchmark_policy: "{{job.parameters.benchmark_policy}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              target: "{{job.parameters.target}}"
               llm_model: "{{job.parameters.llm_model}}"
               genie_llm_route: "{{job.parameters.genie_llm_route}}"
           environment_key: default
@@ -196,6 +202,7 @@ resources:
               target_accuracy: "{{job.parameters.target_accuracy}}"
               benchmark_policy: "{{job.parameters.benchmark_policy}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              target: "{{job.parameters.target}}"
               llm_model: "{{job.parameters.llm_model}}"
               genie_llm_route: "{{job.parameters.genie_llm_route}}"
               # Metric view advisor phase inputs (MV-D5). Passing these as
@@ -226,6 +233,7 @@ resources:
               max_attempts: "{{job.parameters.max_attempts}}"
               benchmark_policy: "{{job.parameters.benchmark_policy}}"
               warehouse_id: "{{job.parameters.warehouse_id}}"
+              target: "{{job.parameters.target}}"
               llm_model: "{{job.parameters.llm_model}}"
               genie_llm_route: "{{job.parameters.genie_llm_route}}"
           environment_key: default
@@ -248,7 +256,6 @@ resources:
 #                 Terraform state, but name_prefix: "" for clean resource names.
 #                 run_as is NOT set here; the app self-heals it at startup
 #                 (avoids needing servicePrincipal.user role on the deployer).
-# - dev-lakebase: Development with Lakebase provisioning
 # ---------------------------------------------------------------------------
 targets:
   dev:
@@ -258,13 +265,3 @@ targets:
     mode: development
     presets:
       name_prefix: ""
-  dev-lakebase:
-    mode: development
-    resources:
-      postgres_projects:
-        genie-workbench-db:
-          project_id: ${var.app_name}-db
-          default_endpoint_settings:
-            autoscaling_limit_min_cu: 0.5
-            autoscaling_limit_max_cu: 4
-            suspend_timeout_duration: "3600s"

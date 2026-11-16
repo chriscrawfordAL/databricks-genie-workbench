@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from genie_space_optimizer.common.agent_target import agent_client, require_no_remote_spark
+
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
     from pyspark.sql import DataFrame, SparkSession
@@ -107,6 +109,7 @@ def get_columns_for_tables_rest(
     lookups downstream, avoiding short-name collisions in multi-catalog
     setups.
     """
+    w = agent_client(w)
     rows: list[dict] = []
     failed: list[str] = []
     for cat, sch, tbl in refs:
@@ -158,6 +161,7 @@ def get_foreign_keys_for_tables_rest(
     Multi-column FKs are represented as a single dict with list-valued
     ``child_columns`` / ``parent_columns``.
     """
+    w = agent_client(w)
     rows: list[dict] = []
     failed: list[str] = []
     for cat, sch, tbl in refs:
@@ -206,6 +210,7 @@ def get_routines_for_schemas_rest(
     dicts matching the Spark output: ``routine_name``, ``routine_type``,
     ``routine_definition``, ``return_type``, ``routine_schema``.
     """
+    w = agent_client(w)
     schemas = get_unique_schemas(refs)
     rows: list[dict] = []
     for cat, sch in schemas:
@@ -240,6 +245,7 @@ def get_tags_for_tables_rest(
     ``information_schema.table_tags`` output: ``catalog_name``,
     ``schema_name``, ``table_name``, ``tag_name``, ``tag_value``.
     """
+    w = agent_client(w)
     rows: list[dict] = []
     failed: list[str] = []
     for cat, sch, tbl in refs:
@@ -284,6 +290,7 @@ def get_columns_for_tables(
     Unlike ``get_columns`` which returns all columns in a schema, this function
     queries ``information_schema`` scoped to the exact table names.
     """
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     schema_groups: dict[tuple[str, str], list[str]] = {}
     for cat, sch, tbl in refs:
         if cat and sch and tbl:
@@ -315,6 +322,7 @@ def get_tags_for_tables(
     refs: list[tuple[str, str, str]],
 ) -> "DataFrame":
     """Fetch table and column tags for the referenced Genie Agent tables."""
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     schema_groups: dict[tuple[str, str], list[str]] = {}
     for cat, sch, tbl in refs:
         if cat and sch and tbl:
@@ -342,6 +350,7 @@ def get_routines_for_schemas(
     refs: list[tuple[str, str, str]],
 ) -> "DataFrame":
     """Fetch routines for schemas that contain Genie Agent table references."""
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     schemas = get_unique_schemas(refs)
     unions: list[str] = []
     for cat, sch in schemas:
@@ -368,6 +377,7 @@ def get_foreign_keys_for_tables(
 
     Returns the same schema as ``get_foreign_keys_for_tables_rest``.
     """
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     schemas = get_unique_schemas(refs)
     ref_set = {f"{c}.{s}.{t}".lower() for c, s, t in refs if c and s and t}
 
@@ -448,6 +458,7 @@ def get_columns(spark: SparkSession, catalog: str, schema: str) -> DataFrame:
 
     Returns columns: ``table_name``, ``column_name``, ``data_type``, ``comment``.
     """
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     return spark.sql(
         f"SELECT c.table_name, c.column_name, c.data_type, c.comment, c.ordinal_position, t.table_type "
         f"FROM {catalog}.information_schema.columns c "
@@ -462,6 +473,7 @@ def get_tags(spark: SparkSession, catalog: str, schema: str) -> DataFrame:
 
     Table-level rows have a null ``column_name``.
     """
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     return spark.sql(
         f"SELECT catalog_name, schema_name, table_name, "
         f"CAST(NULL AS STRING) AS column_name, tag_name, tag_value "
@@ -479,6 +491,7 @@ def get_routines(spark: SparkSession, catalog: str, schema: str) -> DataFrame:
     Returns columns: ``routine_name``, ``routine_type``,
     ``routine_definition``, ``return_type``, ``routine_schema``.
     """
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     return spark.sql(
         f"SELECT routine_name, routine_type, routine_definition, "
         f"data_type AS return_type, routine_schema "
@@ -492,6 +505,7 @@ def get_table_descriptions(spark: SparkSession, catalog: str, schema: str) -> Da
 
     Returns columns: ``table_name``, ``comment``.
     """
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     return spark.sql(
         f"SELECT table_name, comment "
         f"FROM {catalog}.information_schema.tables "
@@ -505,6 +519,7 @@ def get_metric_views(spark: SparkSession, catalog: str, schema: str) -> DataFram
     Metric views are VIEWs whose names conventionally start with ``mv_``.
     Returns columns: ``table_name``, ``view_definition``.
     """
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     return spark.sql(
         f"SELECT table_name, view_definition "
         f"FROM {catalog}.information_schema.views "
@@ -526,6 +541,7 @@ def describe_tvf_output_columns(
     Falls back to parsing the ``routine_definition`` SQL if DESCRIBE does not
     produce a parseable return-type table.  Returns an empty list on failure.
     """
+    require_no_remote_spark("Unity Catalog metadata via Spark")
     try:
         rows = spark.sql(f"DESCRIBE FUNCTION EXTENDED {tvf_identifier}").collect()
     except Exception:

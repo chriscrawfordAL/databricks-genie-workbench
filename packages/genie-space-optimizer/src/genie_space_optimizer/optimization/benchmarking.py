@@ -103,8 +103,12 @@ def _flag_stale_temporal_benchmarks(
     When *w* and *warehouse_id* are provided, routes the check through the
     SQL warehouse; otherwise uses Spark SQL.
     """
+    from genie_space_optimizer.common.agent_target import agent_sql, remote_active
     from genie_space_optimizer.optimization.benchmarks import _quiet_grpc_logs
 
+    w, warehouse_id = agent_sql(w, warehouse_id)
+    if remote_active() and not (w and warehouse_id):
+        return benchmarks  # advisory check; never run agent SQL on home Spark
     flagged_count = 0
     for b in benchmarks:
         q = b.get("question", "")
@@ -1881,8 +1885,11 @@ def _execute_sql_via_warehouse(
     Raises ``RuntimeError`` on failure with the warehouse error message.
     """
     from databricks.sdk.service.sql import Disposition, Format, StatementState
+    from genie_space_optimizer.common.agent_target import agent_sql
     from genie_space_optimizer.common.query_tags import gso_query_tags
 
+    # Agent data lives in the agent's workspace (remote target, if active).
+    w, warehouse_id = agent_sql(w, warehouse_id)
     resp = w.statement_execution.execute_statement(
         warehouse_id=warehouse_id,
         statement=sql,
@@ -1934,6 +1941,13 @@ def _exec_sql(
     available and *warehouse_id* is set, routes through the Statement
     Execution API.  Otherwise falls back to ``spark.sql().toPandas()``.
     """
+    from genie_space_optimizer.common.agent_target import (
+        agent_sql,
+        remote_active,
+        require_no_remote_spark,
+    )
+
+    w, warehouse_id = agent_sql(w, warehouse_id)
     if w and warehouse_id:
         try:
             return _execute_sql_via_warehouse(
@@ -1941,10 +1955,15 @@ def _exec_sql(
                 catalog=catalog, schema=schema,
             )
         except Exception:
+            # A remote agent's tables are not in the home metastore: never
+            # fall back to the home Spark session — surface the real error.
+            if remote_active():
+                raise
             logger.debug(
                 "Warehouse SQL failed, falling back to Spark: %s",
                 sql[:120], exc_info=True,
             )
+    require_no_remote_spark("Agent SQL")
     if catalog:
         _set_sql_context(spark, catalog, schema)
     return spark.sql(sql).toPandas()

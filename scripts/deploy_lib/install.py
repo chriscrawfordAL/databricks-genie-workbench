@@ -39,6 +39,8 @@ def llm_route_replacements(cfg: InstallConfig) -> dict[str, str]:
     return {
         "GENIE_LLM_ROUTE": cfg.llm_route,
         "GENIE_BYOK_ENABLED": "true" if cfg.byok_enabled else "false",
+        # Empty = the app's built-in curated model picker list.
+        "GENIE_SELECTABLE_MODELS": "",
     }
 
 

@@ -14,6 +14,7 @@
 #   GENIE_LLM_MODEL          (optional)  Default LLM serving endpoint [default: databricks-claude-sonnet-4-6]
 #   GENIE_LLM_ROUTE          (optional)  gateway | classic            [default: gateway]
 #   GENIE_BYOK_ENABLED       (optional)  true | false (gateway only)  [default: false]
+#   GENIE_SELECTABLE_MODELS  (optional)  Comma-separated endpoints for the model picker [default: curated list]
 #   GENIE_STATE_CATALOG      (optional)  Catalog for the app's Delta state tables [default: chosen in the app's Setup dialog]
 #   GENIE_STATE_SCHEMA       (optional)  Schema for the app's Delta state tables  [default: genie_workbench_state]
 #   GENIE_WORKSPACES_SECRET_SCOPE (optional) Secret scope for cross-workspace SP secrets [default: genie-workbench-workspaces]
@@ -45,6 +46,7 @@ PROFILE="${GENIE_DEPLOY_PROFILE:-DEFAULT}"
 LLM_MODEL="${GENIE_LLM_MODEL:-databricks-claude-sonnet-4-6}"
 LLM_ROUTE="$(echo "${GENIE_LLM_ROUTE:-gateway}" | tr '[:upper:]' '[:lower:]')"
 BYOK_ENABLED="$(echo "${GENIE_BYOK_ENABLED:-false}" | tr '[:upper:]' '[:lower:]')"
+SELECTABLE_MODELS="${GENIE_SELECTABLE_MODELS:-}"
 STATE_CATALOG="${GENIE_STATE_CATALOG:-}"
 STATE_SCHEMA="${GENIE_STATE_SCHEMA:-genie_workbench_state}"
 if [ -z "$STATE_CATALOG" ]; then STATE_SCHEMA=""; fi

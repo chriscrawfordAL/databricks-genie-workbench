@@ -111,6 +111,12 @@ env:
   - name: GENIE_BYOK_ENABLED
     value: "__GENIE_BYOK_ENABLED__"
 
+  # Optional comma-separated serving endpoints offered in the model picker
+  # (empty = the built-in curated list). Use it where some models are not
+  # enabled for the workspace. LLM_MODEL is always offered.
+  - name: GENIE_SELECTABLE_MODELS
+    value: "__GENIE_SELECTABLE_MODELS__"
+
   # ---------------------------------------------------------------------------
   # App version + daily release check (see docs: Release update check).
   # The version itself comes from the repo-root VERSION file; the installers

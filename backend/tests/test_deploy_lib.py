@@ -195,11 +195,11 @@ def test_config_llm_route_and_byok_defaults_and_validation():
     base = dict(app_name="genie-workbench", catalog="main", warehouse_id="abc", repo_root="/tmp")
     cfg = InstallConfig(**base).normalized()
     assert (cfg.llm_route, cfg.byok_enabled) == ("gateway", False)
-    assert llm_route_replacements(cfg) == {"GENIE_LLM_ROUTE": "gateway", "GENIE_BYOK_ENABLED": "false"}
+    assert llm_route_replacements(cfg) == {"GENIE_LLM_ROUTE": "gateway", "GENIE_BYOK_ENABLED": "false", "GENIE_SELECTABLE_MODELS": ""}
 
     explicit = InstallConfig(**base, llm_route=" Classic ", byok_enabled=True).normalized()
     assert (explicit.llm_route, explicit.byok_enabled) == ("classic", True)
-    assert llm_route_replacements(explicit) == {"GENIE_LLM_ROUTE": "classic", "GENIE_BYOK_ENABLED": "true"}
+    assert llm_route_replacements(explicit) == {"GENIE_LLM_ROUTE": "classic", "GENIE_BYOK_ENABLED": "true", "GENIE_SELECTABLE_MODELS": ""}
 
     with pytest.raises(ValueError, match="llm_route"):
         InstallConfig(**base, llm_route="serving").validate()

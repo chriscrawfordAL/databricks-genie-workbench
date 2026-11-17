@@ -26,6 +26,9 @@ _CURATED_COMPATIBLE_CHAT_MODELS: tuple[tuple[str, str], ...] = (
     # Create Agent uses Chat Completions tools, so keep it out of the shared picker.
     ("databricks-gpt-5-4", "GPT-5.4"),
     ("databricks-gpt-5-2", "GPT-5.2"),
+    # Databricks-hosted open model: tool calling + plain-text replies verified;
+    # usable where proprietary model access is disabled for the workspace.
+    ("databricks-gpt-oss-120b", "GPT OSS 120B"),
 )
 _CURATED_COMPATIBLE_CHAT_MODEL_NAMES = {
     name for name, _display_name in _CURATED_COMPATIBLE_CHAT_MODELS
@@ -65,6 +68,25 @@ class ModelValidationError(ValueError):
     """Raised when a selected model is not usable for chat completions."""
 
 
+def _selectable_models(default_model: str) -> list[tuple[str, str]]:
+    """The models offered in the picker.
+
+    ``GENIE_SELECTABLE_MODELS`` (comma-separated endpoint names) restricts the
+    picker to models that actually work in this workspace — e.g. where
+    proprietary model access is disabled. The configured default (LLM_MODEL)
+    is always offered so the app never rejects its own default.
+    """
+    display = dict(_CURATED_COMPATIBLE_CHAT_MODELS)
+    raw = os.environ.get("GENIE_SELECTABLE_MODELS", "").strip()
+    if raw and not raw.startswith("__"):
+        names = [n.strip() for n in raw.split(",") if n.strip()]
+    else:
+        names = [n for n, _ in _CURATED_COMPATIBLE_CHAT_MODELS]
+    if default_model and default_model not in names:
+        names.insert(0, default_model)
+    return [(n, display.get(n, n)) for n in dict.fromkeys(names)]
+
+
 def _curated_model_infos(default_model: str) -> list[LLMModelInfo]:
     """Databricks-hosted pay-per-token endpoints supported by this app.
 
@@ -81,7 +103,7 @@ def _curated_model_infos(default_model: str) -> list[LLMModelInfo]:
             optimizerPromptBudgetChars=_optimizer_prompt_budget_chars(),
             contextTier="long",
         )
-        for name, display_name in _CURATED_COMPATIBLE_CHAT_MODELS
+        for name, display_name in _selectable_models(default_model)
     ]
 
 
@@ -100,7 +122,7 @@ def list_chat_models(
     """Return curated chat models known to work with this app's LLM calls."""
     default_model = get_llm_model()
     if default_model not in _CURATED_COMPATIBLE_CHAT_MODEL_NAMES:
-        logger.warning(
+        logger.info(
             "Configured LLM_MODEL=%s is not in the curated selectable model list",
             default_model,
         )
@@ -116,7 +138,7 @@ def validate_chat_model(
     selected = (model_name or "").strip()
     if not selected:
         return None
-    if selected in _CURATED_COMPATIBLE_CHAT_MODEL_NAMES:
+    if selected in {n for n, _ in _selectable_models(get_llm_model())}:
         return selected
 
     # BYOK (spec §1.4/§2, Decision 2): on the gateway route with BYOK enabled,

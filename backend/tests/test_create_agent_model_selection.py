@@ -134,3 +134,18 @@ def test_agent_session_persistence_round_trips_llm_model(monkeypatch):
     assert stored["llm_model"] == "persisted-chat"
     assert loaded is not None
     assert loaded.llm_model == "persisted-chat"
+
+
+def test_selectable_models_env_restricts_picker_and_keeps_default(monkeypatch):
+    import pytest
+    from backend.services import model_catalog
+
+    monkeypatch.setenv("LLM_MODEL", "databricks-gpt-oss-120b")
+    monkeypatch.setenv("GENIE_SELECTABLE_MODELS", "databricks-meta-llama-3-3-70b-instruct")
+    names = [m.name for m in model_catalog.list_chat_models()]
+    assert names == ["databricks-gpt-oss-120b", "databricks-meta-llama-3-3-70b-instruct"]
+    assert model_catalog.validate_chat_model("databricks-gpt-oss-120b") == "databricks-gpt-oss-120b"
+    with pytest.raises(model_catalog.ModelValidationError):
+        model_catalog.validate_chat_model("databricks-claude-opus-5-5")
+    monkeypatch.setenv("GENIE_SELECTABLE_MODELS", "__GENIE_SELECTABLE_MODELS__")
+    assert "databricks-claude-opus-5-5" in [m.name for m in model_catalog.list_chat_models()]
